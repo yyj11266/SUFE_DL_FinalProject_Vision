@@ -128,15 +128,15 @@ if not project_root.exists():
     subprocess.run(["git", "clone", repo_url, str(project_root)], check=True)
 ```
 
-If your folder is mounted somewhere else, set `SUFE_PROJECT_ROOT` to the folder
-containing `src/` before rerunning the first notebook cell.
+If you use an existing local clone at another path, set `SUFE_PROJECT_ROOT` to
+the folder containing `src/` before rerunning the first notebook cell.
 
 Dataset download is guarded by the notebook and config:
 
 - It downloads only when running inside Colab.
 - It downloads or copies the dataset zip to a configured `SUFE_DATA_ZIP`.
 - Local runs must not download the dataset.
-- If `/content/drive/MyDrive/sufe/sample_submission.zip` exists, the notebook inspects it and writes an exact `format_spec.json`.
+- If `/content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip` exists, the notebook inspects it and writes an exact `format_spec.json`.
 - If the sample submission is absent, the notebook infers a provisional format and marks it as `not_verified_by_sample`.
 
 Dataset URL:
@@ -198,39 +198,39 @@ Inspect an extracted dataset:
 
 ```bash
 PYTHONPATH=/content/sufe_vos_leaderboard python -m src.data.inspect_sufe \
-  --root /content/sufe_vos_leaderboard/data/video_dataset \
-  --output /content/sufe_vos_leaderboard/outputs/EXP/data_info.json
+  --root /content/sufe_data/video_dataset \
+  --output /content/sufe_runs/EXP/data_info.json
 ```
 
 Inspect a sample submission:
 
 ```bash
 PYTHONPATH=/content/sufe_vos_leaderboard python -m src.data.submission inspect-sample \
-  --sample /content/drive/MyDrive/sufe/sample_submission.zip \
-  --output /content/sufe_vos_leaderboard/outputs/EXP/format_spec.json
+  --sample /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip \
+  --output /content/sufe_runs/EXP/format_spec.json
 ```
 
 Infer provisional format when no sample exists:
 
 ```bash
 PYTHONPATH=/content/sufe_vos_leaderboard python -m src.data.submission infer-provisional \
-  --data-info /content/sufe_vos_leaderboard/outputs/EXP/data_info.json \
-  --output /content/sufe_vos_leaderboard/outputs/EXP/format_spec.json
+  --data-info /content/sufe_runs/EXP/data_info.json \
+  --output /content/sufe_runs/EXP/format_spec.json
 ```
 
 Create and validate a submission:
 
 ```bash
 PYTHONPATH=/content/sufe_vos_leaderboard python -m src.data.submission make \
-  --pred-root /content/sufe_vos_leaderboard/outputs/EXP/pred_masks \
-  --output-zip /content/sufe_vos_leaderboard/outputs/EXP/submission.zip \
-  --format-spec /content/sufe_vos_leaderboard/outputs/EXP/format_spec.json
+  --pred-root /content/sufe_runs/EXP/pred_masks \
+  --output-zip /content/sufe_runs/EXP/submission.zip \
+  --format-spec /content/sufe_runs/EXP/format_spec.json
 
 PYTHONPATH=/content/sufe_vos_leaderboard python -m src.data.submission validate \
-  --output-zip /content/sufe_vos_leaderboard/outputs/EXP/submission.zip \
-  --format-spec /content/sufe_vos_leaderboard/outputs/EXP/format_spec.json \
-  --data-info /content/sufe_vos_leaderboard/outputs/EXP/data_info.json \
-  --sanity-output /content/sufe_vos_leaderboard/outputs/EXP/sanity_check.json
+  --output-zip /content/sufe_runs/EXP/submission.zip \
+  --format-spec /content/sufe_runs/EXP/format_spec.json \
+  --data-info /content/sufe_runs/EXP/data_info.json \
+  --sanity-output /content/sufe_runs/EXP/sanity_check.json
 ```
 
 ## SAM2.1 Baseline CLI
@@ -254,11 +254,11 @@ python /content/sufe_vos_leaderboard/scripts/run_baseline_sam2.py \
 
 Outputs:
 
-- `outputs/EXP/masks/{video}/{frame}.png`
-- `outputs/EXP/overlays/{video}/{frame}.jpg`
-- `outputs/EXP/logs/per_video_status.json`
-- `outputs/EXP/submission.zip`
-- `outputs/EXP/sanity_check.json`
+- `/content/sufe_runs/EXP/masks/{video}/{frame}.png`
+- `/content/sufe_runs/EXP/overlays/{video}/{frame}.jpg`
+- `/content/sufe_runs/EXP/logs/per_video_status.json`
+- `/content/sufe_runs/EXP/submission.zip`
+- `/content/sufe_runs/EXP/sanity_check.json`
 
 ## SAM2.1 Pseudo-Anchor Optimization
 
@@ -294,12 +294,12 @@ python /content/sufe_vos_leaderboard/scripts/run_enhanced_sam2_anchors.py \
 
 Outputs:
 
-- `outputs/EXP/masks/{video}/{frame}.png`
-- `outputs/EXP/anchor_runs/{video}/anchor_{frame}/`
-- `outputs/EXP/logs/self_diagnostics.csv`
-- `outputs/EXP/logs/fusion_debug.csv`
-- `outputs/EXP/submission.zip`
-- `outputs/EXP/sanity_check.json`
+- `/content/sufe_runs/EXP/masks/{video}/{frame}.png`
+- `/content/sufe_runs/EXP/anchor_runs/{video}/anchor_{frame}/`
+- `/content/sufe_runs/EXP/logs/self_diagnostics.csv`
+- `/content/sufe_runs/EXP/logs/fusion_debug.csv`
+- `/content/sufe_runs/EXP/submission.zip`
+- `/content/sufe_runs/EXP/sanity_check.json`
 
 ## Anchor Mining CLI
 
@@ -307,17 +307,17 @@ Mine object-level anchors from an ordered frame directory and first-frame mask:
 
 ```bash
 PYTHONPATH=/content/sufe_vos_leaderboard python -m src.vos.anchor_mining \
-  --frames-dir /content/sufe_vos_leaderboard/outputs/EXP/cache/frames/VIDEO \
-  --initial-mask /content/sufe_vos_leaderboard/data/video_dataset/Annotations/VIDEO/00000.png \
-  --output-dir /content/sufe_vos_leaderboard/outputs/EXP \
+  --frames-dir /content/sufe_runs/EXP/cache/frames/VIDEO \
+  --initial-mask /content/sufe_data/video_dataset/Annotations/VIDEO/00000.png \
+  --output-dir /content/sufe_runs/EXP \
   --video-id VIDEO \
   --object-id 1
 ```
 
 Outputs:
 
-- `outputs/EXP/anchors/{video}/{object_id}_anchors.json`
-- `outputs/EXP/anchors/{video}/anchor_debug.mp4`
+- `/content/sufe_runs/EXP/anchors/{video}/{object_id}_anchors.json`
+- `/content/sufe_runs/EXP/anchors/{video}/anchor_debug.mp4`
 
 ## Main Baseline
 
@@ -378,7 +378,7 @@ sufe_vos_leaderboard/
 ├── src/eval
 ├── src/viz
 ├── scripts
-├── outputs
+├── tests
 └── README.md
 ```
 

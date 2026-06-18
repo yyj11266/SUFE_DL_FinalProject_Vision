@@ -15,9 +15,9 @@ runtime:
 data:
   download_only_on_colab: true
   google_drive_url: https://drive.google.com/file/d/12PLrZwDvpeO3n-IQbAMgA9FOM0xdOqRr/view?usp=sharing
-  zip_path: /content/sufe_vos_leaderboard/data/video_dataset.zip
-  extract_dir: /content/sufe_vos_leaderboard/data/video_dataset
-  sample_submission_zip: /content/drive/MyDrive/sufe/sample_submission.zip
+  zip_path: /content/drive/MyDrive/sufe_vos_inputs/video_dataset.zip
+  extract_dir: /content/sufe_data/video_dataset
+  sample_submission_zip: /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip
   structure_autodetect: true
   frame_extensions: [jpg, jpeg, png, bmp, webp]
   video_extensions: [mp4, avi, mov, mkv]
@@ -45,7 +45,7 @@ baseline:
   backend: sam2
   required: true
   checkpoint_url: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
-  checkpoint_path: /content/sufe_vos_leaderboard/checkpoints/sam2.1_hiera_large.pt
+  checkpoint_path: /content/sufe_checkpoints/sam2.1_hiera_large.pt
   model_cfg: configs/sam2.1/sam2.1_hiera_l.yaml
   hf_model_id: facebook/sam2.1-hiera-large
   use_hf_fallback: true
@@ -134,7 +134,7 @@ debug:
   save_intermediate_masks: false
 
 outputs:
-  root: /content/sufe_vos_leaderboard/outputs
+  root: /content/sufe_runs
   required_artifacts:
     - data_info.json
     - format_spec.json

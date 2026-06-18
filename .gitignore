@@ -5,12 +5,13 @@ __pycache__/
 *.py[cod]
 
 # Large/local experiment state
-data/
-outputs/
-checkpoints/
-raw_logits/
-native_state/
-anchor_runs/
+/data/
+/outputs/*
+!/outputs/.gitkeep
+/checkpoints/
+/raw_logits/
+/native_state/
+/anchor_runs/
 *.zip
 *.tar
 *.tar.gz
@@ -19,5 +20,4 @@ anchor_runs/
 *.pth
 
 # Keep explicit placeholders if needed.
-!outputs/.gitkeep
 !scripts/.gitkeep
