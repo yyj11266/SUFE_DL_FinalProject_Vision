@@ -249,7 +249,221 @@ def _select_video(data_root: Path, video_id: str) -> Any:
     return by_id[video_id]
 
 
-def _checkpoint_key_summary(checkpoint: Path | None) -> dict[str, Any]:
+def _key_prefix_summary(keys: list[str], sample_limit: int = 80) -> dict[str, Any]:
+    one_part = Counter(key.split(".")[0] for key in keys)
+    two_part = Counter(".".join(key.split(".")[:2]) for key in keys)
+    return {
+        "state_key_count": len(keys),
+        "state_key_examples": keys[:sample_limit],
+        "top_prefix_counts": one_part.most_common(40),
+        "top_two_part_prefix_counts": two_part.most_common(60),
+    }
+
+
+def _shape_tuple(value: Any) -> tuple[int, ...] | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(dim) for dim in shape)
+    except Exception:
+        return None
+
+
+def _same_shape(source: Any, target: Any) -> bool:
+    source_shape = _shape_tuple(source)
+    target_shape = _shape_tuple(target)
+    if source_shape is None or target_shape is None:
+        return True
+    return source_shape == target_shape
+
+
+def _model_state_key_summary(model: Any) -> dict[str, Any]:
+    try:
+        state = model.state_dict()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    keys = [str(key) for key in state.keys()]
+    summary = _key_prefix_summary(keys)
+    for prefix in (
+        "tracker.",
+        "model.",
+        "sam2_predictor.",
+        "detector.",
+        "backbone.",
+        "maskmem_backbone.",
+        "sam_prompt_encoder.",
+        "sam_mask_decoder.",
+        "transformer.",
+        "segmentation_head.",
+    ):
+        summary[f"has_prefix:{prefix}"] = any(key.startswith(prefix) for key in keys)
+    for key in (
+        "maskmem_tpos_enc",
+        "interactivity_no_mem_embed",
+        "no_obj_embed_spatial",
+        "output_valid_embed",
+        "output_invalid_embed",
+    ):
+        summary[f"has_key:{key}"] = key in state
+    return summary
+
+
+def _checkpoint_model_coverage(state: Mapping[str, Any], model: Any) -> dict[str, Any]:
+    try:
+        model_state = model.state_dict()
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+    def identity(key: str) -> str | None:
+        return key
+
+    def strip_tracker_model(key: str) -> str | None:
+        return key[len("tracker.model.") :] if key.startswith("tracker.model.") else None
+
+    def strip_sam2_predictor_model(key: str) -> str | None:
+        return key[len("sam2_predictor.model.") :] if key.startswith("sam2_predictor.model.") else None
+
+    def strip_sam2_predictor(key: str) -> str | None:
+        return key[len("sam2_predictor.") :] if key.startswith("sam2_predictor.") else None
+
+    def detector_backbone_to_backbone(key: str) -> str | None:
+        prefix = "detector.backbone.vision_backbone."
+        if key.startswith(prefix):
+            return "backbone.vision_backbone." + key[len(prefix) :]
+        return None
+
+    def strip_detector(key: str) -> str | None:
+        return key[len("detector.") :] if key.startswith("detector.") else None
+
+    transforms = (
+        ("identity", identity),
+        ("strip_tracker_model", strip_tracker_model),
+        ("strip_sam2_predictor_model", strip_sam2_predictor_model),
+        ("strip_sam2_predictor", strip_sam2_predictor),
+        ("detector_backbone_to_backbone", detector_backbone_to_backbone),
+        ("strip_detector", strip_detector),
+    )
+
+    model_keys = set(str(key) for key in model_state.keys())
+    checkpoint_items = [(str(key), value) for key, value in state.items()]
+    transform_rows: list[dict[str, Any]] = []
+    for name, transform in transforms:
+        candidates = 0
+        key_matches = 0
+        shape_matches = 0
+        shape_mismatches = 0
+        matched_examples: list[dict[str, str]] = []
+        mismatch_examples: list[dict[str, Any]] = []
+        for source_key, source_value in checkpoint_items:
+            target_key = transform(source_key)
+            if target_key is None:
+                continue
+            candidates += 1
+            if target_key not in model_keys:
+                continue
+            key_matches += 1
+            target_value = model_state[target_key]
+            if _same_shape(source_value, target_value):
+                shape_matches += 1
+                if len(matched_examples) < 20:
+                    matched_examples.append({"source": source_key, "target": target_key})
+            else:
+                shape_mismatches += 1
+                if len(mismatch_examples) < 20:
+                    mismatch_examples.append(
+                        {
+                            "source": source_key,
+                            "target": target_key,
+                            "source_shape": list(_shape_tuple(source_value) or ()),
+                            "target_shape": list(_shape_tuple(target_value) or ()),
+                        }
+                    )
+        transform_rows.append(
+            {
+                "transform": name,
+                "candidate_checkpoint_keys": candidates,
+                "model_key_matches": key_matches,
+                "shape_matches": shape_matches,
+                "shape_mismatches": shape_mismatches,
+                "matched_examples": matched_examples,
+                "mismatch_examples": mismatch_examples,
+            }
+        )
+
+    priority = (
+        ("identity", identity),
+        ("strip_tracker_model", strip_tracker_model),
+        ("strip_sam2_predictor_model", strip_sam2_predictor_model),
+        ("strip_sam2_predictor", strip_sam2_predictor),
+        ("detector_backbone_to_backbone", detector_backbone_to_backbone),
+        ("strip_detector", strip_detector),
+    )
+    covered_targets: dict[str, str] = {}
+    covered_sources: dict[str, str] = {}
+    source_prefix_counts: Counter[str] = Counter()
+    for source_key, source_value in checkpoint_items:
+        for name, transform in priority:
+            target_key = transform(source_key)
+            if target_key is None or target_key not in model_keys:
+                continue
+            if not _same_shape(source_value, model_state[target_key]):
+                continue
+            covered_targets.setdefault(target_key, name)
+            covered_sources[source_key] = name
+            if source_key.startswith("tracker.model."):
+                source_prefix_counts["tracker.model"] += 1
+            elif source_key.startswith("detector.backbone.vision_backbone."):
+                source_prefix_counts["detector.backbone.vision_backbone"] += 1
+            elif source_key.startswith("detector."):
+                source_prefix_counts["detector"] += 1
+            elif source_key.startswith("sam2_predictor."):
+                source_prefix_counts["sam2_predictor"] += 1
+            else:
+                source_prefix_counts["direct_or_other"] += 1
+            break
+
+    critical_prefixes = (
+        "backbone.vision_backbone.",
+        "maskmem_backbone.",
+        "transformer.",
+        "sam_prompt_encoder.",
+        "sam_mask_decoder.",
+        "segmentation_head.",
+    )
+    missing_critical_prefixes = [
+        prefix
+        for prefix in critical_prefixes
+        if any(key.startswith(prefix) for key in model_keys)
+        and not any(key.startswith(prefix) for key in covered_targets)
+    ]
+    for key in (
+        "maskmem_tpos_enc",
+        "interactivity_no_mem_embed",
+        "no_obj_embed_spatial",
+        "output_valid_embed",
+        "output_invalid_embed",
+    ):
+        if key in model_keys and key not in covered_targets:
+            missing_critical_prefixes.append(key)
+
+    return {
+        "checkpoint_keys": len(checkpoint_items),
+        "model_keys": len(model_keys),
+        "transform_coverage": transform_rows,
+        "priority_union": {
+            "covered_checkpoint_keys": len(covered_sources),
+            "covered_model_keys": len(covered_targets),
+            "uncovered_model_keys": max(0, len(model_keys) - len(covered_targets)),
+            "source_prefix_counts": source_prefix_counts.most_common(),
+            "missing_critical_prefixes": missing_critical_prefixes,
+            "covered_model_key_examples": list(covered_targets.keys())[:40],
+            "uncovered_model_key_examples": [key for key in sorted(model_keys) if key not in covered_targets][:40],
+        },
+    }
+
+
+def _checkpoint_key_summary(checkpoint: Path | None, model: Any | None = None) -> dict[str, Any]:
     if checkpoint is None:
         return {"checkpoint": None, "exists": False}
     path = Path(checkpoint).expanduser()
@@ -274,12 +488,7 @@ def _checkpoint_key_summary(checkpoint: Path | None) -> dict[str, Any]:
             summary["uses_model_key"] = False
         if isinstance(state, Mapping):
             keys = [str(key) for key in state.keys()]
-            one_part = Counter(key.split(".")[0] for key in keys)
-            two_part = Counter(".".join(key.split(".")[:2]) for key in keys)
-            summary["state_key_count"] = len(keys)
-            summary["state_key_examples"] = keys[:80]
-            summary["top_prefix_counts"] = one_part.most_common(40)
-            summary["top_two_part_prefix_counts"] = two_part.most_common(60)
+            summary.update(_key_prefix_summary(keys))
             for prefix in (
                 "tracker.",
                 "sam2_predictor.",
@@ -299,6 +508,8 @@ def _checkpoint_key_summary(checkpoint: Path | None) -> dict[str, Any]:
                 "output_invalid_embed",
             ):
                 summary[f"has_key:{key}"] = key in state
+            if model is not None:
+                summary["model_coverage"] = _checkpoint_model_coverage(state, model)
         else:
             summary["state_key_count"] = None
     except Exception as exc:
@@ -468,7 +679,8 @@ def main(argv: list[str] | None = None) -> int:
             "experiment_id": args.experiment_id,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "checkpoint": str(checkpoint),
-            "checkpoint_keys": _checkpoint_key_summary(checkpoint),
+            "checkpoint_keys": _checkpoint_key_summary(checkpoint, model),
+            "model_state_keys": _model_state_key_summary(model),
             "build": build.to_dict(),
             "predictor_class": f"{type(predictor).__module__}.{type(predictor).__name__}",
             "model_class": f"{type(model).__module__}.{type(model).__name__}",
