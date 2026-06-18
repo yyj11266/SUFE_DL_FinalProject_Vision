@@ -1,0 +1,145 @@
+project:
+  name: sufe_vos_leaderboard
+  root: /content/sufe_vos_leaderboard
+  seed: 2026
+  experiment_prefix: sam21_hiera_large
+
+runtime:
+  device: cuda
+  mixed_precision: bf16
+  torch_compile: false
+  num_workers: 2
+  deterministic: false
+  allow_tf32: true
+
+data:
+  download_only_on_colab: true
+  google_drive_url: https://drive.google.com/file/d/12PLrZwDvpeO3n-IQbAMgA9FOM0xdOqRr/view?usp=sharing
+  zip_path: /content/sufe_vos_leaderboard/data/video_dataset.zip
+  extract_dir: /content/sufe_vos_leaderboard/data/video_dataset
+  sample_submission_zip: /content/drive/MyDrive/sufe/sample_submission.zip
+  structure_autodetect: true
+  frame_extensions: [jpg, jpeg, png, bmp, webp]
+  video_extensions: [mp4, avi, mov, mkv]
+  prompt_file_candidates:
+    - prompts.json
+    - initial_prompts.json
+    - first_frame_prompt.json
+    - annotations.json
+  sample_submission_candidates:
+    - sample_submission.zip
+    - sample_submission.csv
+    - sample_submission.json
+    - submission_sample.zip
+
+submission:
+  output_name: submission.zip
+  match_sample_submission: true
+  compression: zip_deflated
+  mask_format: auto
+  rle_order: auto
+  preserve_sample_paths: true
+
+baseline:
+  name: sam2_1_hiera_large
+  backend: sam2
+  required: true
+  checkpoint_url: https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+  checkpoint_path: /content/sufe_vos_leaderboard/checkpoints/sam2.1_hiera_large.pt
+  model_cfg: configs/sam2.1/sam2.1_hiera_l.yaml
+  hf_model_id: facebook/sam2.1-hiera-large
+  use_hf_fallback: true
+
+strategy:
+  target_type_classifier:
+    enabled: true
+    method: heuristic_prompt_frame
+    min_area_ratio: 0.0001
+    large_area_ratio: 0.12
+    elongated_aspect_ratio: 3.5
+
+  anchor_mining:
+    enabled: true
+    max_anchors_per_object: 5
+    min_anchor_spacing: 8
+    positive_points_per_anchor: 3
+    negative_points_per_anchor: 4
+    sample_boundary_negatives: true
+
+  reliability_scoring:
+    enabled: true
+    score_components:
+      mask_iou_stability: 0.30
+      area_consistency: 0.20
+      motion_consistency: 0.20
+      prompt_agreement: 0.20
+      distractor_margin: 0.10
+    low_confidence_threshold: 0.45
+    high_confidence_threshold: 0.72
+
+  drift_lost_detection:
+    enabled: true
+    lost_threshold: 0.35
+    max_area_jump_ratio: 2.5
+    min_area_keep_ratio: 0.15
+    center_jump_factor: 3.0
+    trigger_reprompt: true
+
+  prompt_fusion:
+    enabled: true
+    fuse_box_points_mask: true
+    box_padding_ratio: 0.04
+    point_weight: 1.0
+    box_weight: 0.8
+    mask_weight: 1.2
+
+  propagation:
+    multi_anchor_bidirectional: true
+    forward_backward_merge: reliability_weighted
+    temporal_window: 48
+    max_reprompt_rounds: 2
+
+  memory_tree:
+    enabled: true
+    style: sam2long_like
+    max_nodes: 16
+    branch_on_low_confidence: true
+    prune_policy: reliability_diversity
+
+  motion_gate:
+    enabled: true
+    style: samurai_like
+    kalman_like_state: true
+    gate_iou_threshold: 0.05
+    gate_center_sigma: 3.0
+
+  distractor_memory:
+    enabled: true
+    style: dam4sam_like
+    store_negative_masks: true
+    max_distractors: 8
+    suppress_overlap_iou: 0.35
+
+  ensemble:
+    enabled: false
+    merge_policy: reliability_weighted_vote
+    min_backend_agreement: 1
+
+debug:
+  enabled: true
+  overlays: true
+  videos: true
+  overlay_stride: 1
+  max_debug_videos: 20
+  save_intermediate_masks: false
+
+outputs:
+  root: /content/sufe_vos_leaderboard/outputs
+  required_artifacts:
+    - data_info.json
+    - format_spec.json
+    - submission.zip
+    - sanity_check.json
+    - experiment_log.csv
+    - debug_overlays
+    - debug_videos

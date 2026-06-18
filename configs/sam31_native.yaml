@@ -1,0 +1,33 @@
+backend: sam3.1_object_multiplex
+hf_repo_id: research21/sam3.1
+checkpoint_filename: sam3.1_multiplex.pt
+prompt_mode: mask
+original_resolution: true
+precision: bfloat16
+multiplex_count: 16
+use_fa3: false
+use_rope_real: false
+compile: false
+save_native_scores: true
+save_raw_logits: false
+offload_video_to_cpu: false
+offload_state_to_cpu: false
+first_frame_policy: copy_input_annotation_exactly
+fallback_policy: fail_without_fallback
+recovery:
+  enabled: false
+  reason: enable_only_after_external_holdout_gain_at_least_0.4
+  max_branches_per_object: 3
+  confirmation_frames: 2
+cutie:
+  enabled: false
+  minimum_holdout_gain: 0.4
+  maximum_major_slice_regression: 0.5
+  fusion_grain: object_frame
+  default_backend: sam3.1
+validation:
+  dataset: MOSEv2
+  seed: 2026
+  total_videos: 80
+  calibration_videos: 40
+  holdout_videos: 40

@@ -1,0 +1,23 @@
+.DS_Store
+.pytest_cache/
+.idea/
+__pycache__/
+*.py[cod]
+
+# Large/local experiment state
+data/
+outputs/
+checkpoints/
+raw_logits/
+native_state/
+anchor_runs/
+*.zip
+*.tar
+*.tar.gz
+*.tar.zst
+*.pt
+*.pth
+
+# Keep explicit placeholders if needed.
+!outputs/.gitkeep
+!scripts/.gitkeep

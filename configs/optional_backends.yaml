@@ -1,0 +1,49 @@
+optional_backends:
+  sam3:
+    enabled: true
+    required: true
+    install: null
+    adapter: src.trackers.sam3_tracker_optional
+    notes: SAM 3.1 Object Multiplex mainline. Native add_new_masks is mandatory; setup failures stop the SAM 3.1 run without SAM2 or point-prompt fallback.
+
+  sam3_detector:
+    enabled: false
+    required: false
+    install: null
+    adapter: src.detectors.sam3_detector_optional
+    notes: Optional SAM3 visual/text prompt detector for anchor mining and re-detection.
+
+  cutie:
+    enabled: false
+    required: false
+    install: null
+    adapter: src.vos.optional_cutie
+    notes: Optional VOS backend for propagation or ensemble.
+
+  sutrack:
+    enabled: false
+    required: false
+    install: null
+    adapter: src.trackers.optional_sutrack
+    notes: Optional tracker backend for motion proposals and re-detection.
+
+  groundingdino:
+    enabled: false
+    required: false
+    install: null
+    adapter: src.detectors.optional_groundingdino
+    notes: Optional text/object detector for re-detection and distractor mining.
+
+  trex2:
+    enabled: false
+    required: false
+    install: null
+    adapter: src.detectors.optional_trex2
+    notes: Optional visual prompt detector for target re-localization.
+
+  dinov3:
+    enabled: false
+    required: false
+    install: null
+    adapter: src.features.optional_dinov3
+    notes: Optional feature extractor for anchor ranking and reliability scoring.
