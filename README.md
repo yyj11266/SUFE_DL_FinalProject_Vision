@@ -76,6 +76,8 @@ python scripts/debug_sam31_api.py \
 
 This writes `logs/sam31_api_introspection.json` and
 `logs/sam31_state_probe.json` without creating a submission.
+The Colab notebook also copies these probe JSON files to
+`MyDrive/sufe_vos_review/runs/EXP_ID/` for Codex review.
 
 Create the frozen MOSEv2 split:
 

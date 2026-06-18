@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import traceback
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -248,6 +249,63 @@ def _select_video(data_root: Path, video_id: str) -> Any:
     return by_id[video_id]
 
 
+def _checkpoint_key_summary(checkpoint: Path | None) -> dict[str, Any]:
+    if checkpoint is None:
+        return {"checkpoint": None, "exists": False}
+    path = Path(checkpoint).expanduser()
+    summary: dict[str, Any] = {
+        "checkpoint": str(path),
+        "exists": path.exists(),
+        "size_bytes": path.stat().st_size if path.exists() else None,
+    }
+    if not path.exists():
+        return summary
+    try:
+        import torch
+
+        payload = torch.load(str(path), map_location="cpu", weights_only=True)
+        summary["payload_type"] = type(payload).__module__ + "." + type(payload).__name__
+        if isinstance(payload, Mapping):
+            summary["top_level_keys"] = [str(key) for key in list(payload.keys())[:80]]
+            state = payload.get("model") if isinstance(payload.get("model"), Mapping) else payload
+            summary["uses_model_key"] = state is not payload
+        else:
+            state = None
+            summary["uses_model_key"] = False
+        if isinstance(state, Mapping):
+            keys = [str(key) for key in state.keys()]
+            one_part = Counter(key.split(".")[0] for key in keys)
+            two_part = Counter(".".join(key.split(".")[:2]) for key in keys)
+            summary["state_key_count"] = len(keys)
+            summary["state_key_examples"] = keys[:80]
+            summary["top_prefix_counts"] = one_part.most_common(40)
+            summary["top_two_part_prefix_counts"] = two_part.most_common(60)
+            for prefix in (
+                "tracker.",
+                "sam2_predictor.",
+                "detector.",
+                "backbone.",
+                "maskmem_backbone.",
+                "sam_prompt_encoder.",
+                "sam_mask_decoder.",
+                "transformer.",
+            ):
+                summary[f"has_prefix:{prefix}"] = any(key.startswith(prefix) for key in keys)
+            for key in (
+                "maskmem_tpos_enc",
+                "interactivity_no_mem_embed",
+                "no_obj_embed_spatial",
+                "output_valid_embed",
+                "output_invalid_embed",
+            ):
+                summary[f"has_key:{key}"] = key in state
+        else:
+            summary["state_key_count"] = None
+    except Exception as exc:
+        summary["error"] = f"{type(exc).__name__}: {exc}"
+    return summary
+
+
 def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any) -> dict[str, Any]:
     import torch
 
@@ -410,6 +468,7 @@ def main(argv: list[str] | None = None) -> int:
             "experiment_id": args.experiment_id,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "checkpoint": str(checkpoint),
+            "checkpoint_keys": _checkpoint_key_summary(checkpoint),
             "build": build.to_dict(),
             "predictor_class": f"{type(predictor).__module__}.{type(predictor).__name__}",
             "model_class": f"{type(model).__module__}.{type(model).__name__}",
