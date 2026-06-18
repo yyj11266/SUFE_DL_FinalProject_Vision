@@ -1045,7 +1045,7 @@ def _state_summary(state: Any, object_ids: list[int], version: dict[str, Any]) -
             }
         if isinstance(sam2_states, Sequence) and not isinstance(sam2_states, (str, bytes)):
             summary["sam2_inference_states"] = [
-                {"obj_ids": [int(value) for value in state_item.get("obj_ids", [])]}
+                _sam2_tracker_state_summary(state_item)
                 for state_item in sam2_states
                 if isinstance(state_item, Mapping)
             ]
@@ -1110,6 +1110,108 @@ def _write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def _compact_tensor_summary(value: Any, per_object_limit: int = 16) -> dict[str, Any]:
+    array = _to_numpy(value)
+    summary: dict[str, Any] = {
+        "shape": [int(dim) for dim in array.shape],
+        "dtype": str(array.dtype),
+    }
+    if array.size == 0:
+        summary["empty"] = True
+        return summary
+    summary["min"] = float(np.nanmin(array))
+    summary["max"] = float(np.nanmax(array))
+    summary["mean"] = float(np.nanmean(array))
+    if array.ndim >= 3:
+        per_object = array.reshape(array.shape[0], -1)
+        limited = per_object[:per_object_limit]
+        summary["per_object_positive_pixels"] = [int((row > 0).sum()) for row in limited]
+        summary["per_object_max"] = [float(np.nanmax(row)) for row in limited]
+        summary["per_object_mean"] = [float(np.nanmean(row)) for row in limited]
+    elif array.size <= per_object_limit:
+        summary["values"] = array.reshape(-1).tolist()
+    return summary
+
+
+def _frame_output_summary(outputs: Any) -> dict[str, Any]:
+    if not isinstance(outputs, Mapping):
+        return {"type": type(outputs).__module__ + "." + type(outputs).__name__}
+    summary: dict[str, Any] = {"keys": sorted(str(key) for key in outputs.keys())}
+    local_map = outputs.get("local_obj_id_to_idx", {})
+    if isinstance(local_map, Mapping):
+        summary["local_obj_id_to_idx"] = {str(key): int(value) for key, value in local_map.items()}
+        summary["local_object_ids_by_index"] = [
+            int(key)
+            for key, _value in sorted(local_map.items(), key=lambda item: int(item[1]))
+        ]
+    conditioning_objects = outputs.get("conditioning_objects")
+    if isinstance(conditioning_objects, (set, frozenset, list, tuple)):
+        summary["conditioning_objects"] = sorted(int(value) for value in conditioning_objects)
+    for key in ("pred_masks", "object_score_logits", "iou_score", "iou_predictions"):
+        if key in outputs:
+            summary[key] = _compact_tensor_summary(outputs[key])
+    return summary
+
+
+def _sam2_tracker_state_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    output_dict = state.get("output_dict", {})
+    cond_outputs = output_dict.get("cond_frame_outputs", {}) if isinstance(output_dict, Mapping) else {}
+    non_cond_outputs = output_dict.get("non_cond_frame_outputs", {}) if isinstance(output_dict, Mapping) else {}
+    per_object = state.get("output_dict_per_obj", {})
+    mask_inputs = state.get("mask_inputs_per_obj", {})
+    point_inputs = state.get("point_inputs_per_obj", {})
+    frames_already_tracked = state.get("frames_already_tracked", {})
+    consolidated = state.get("consolidated_frame_inds", {})
+
+    summary: dict[str, Any] = {
+        "obj_ids": [int(value) for value in state.get("obj_ids", [])],
+        "first_ann_frame_idx": state.get("first_ann_frame_idx"),
+        "tracking_has_started": bool(state.get("tracking_has_started", False)),
+    }
+    if isinstance(frames_already_tracked, Mapping):
+        summary["frames_already_tracked"] = sorted(int(frame_idx) for frame_idx in frames_already_tracked)
+    if isinstance(consolidated, Mapping):
+        summary["consolidated_frame_inds"] = {
+            str(key): sorted(int(value) for value in values)
+            for key, values in consolidated.items()
+            if isinstance(values, (set, list, tuple))
+        }
+    if isinstance(mask_inputs, Mapping):
+        summary["mask_input_frames_per_obj_idx"] = {
+            str(obj_idx): sorted(int(frame_idx) for frame_idx in frames)
+            for obj_idx, frames in mask_inputs.items()
+            if isinstance(frames, Mapping)
+        }
+    if isinstance(point_inputs, Mapping):
+        summary["point_input_frames_per_obj_idx"] = {
+            str(obj_idx): sorted(int(frame_idx) for frame_idx in frames)
+            for obj_idx, frames in point_inputs.items()
+            if isinstance(frames, Mapping)
+        }
+    if isinstance(cond_outputs, Mapping):
+        summary["cond_frame_outputs"] = {
+            str(int(frame_idx)): _frame_output_summary(outputs)
+            for frame_idx, outputs in sorted(cond_outputs.items(), key=lambda item: int(item[0]))
+        }
+    if isinstance(non_cond_outputs, Mapping):
+        summary["non_cond_frame_outputs"] = {
+            str(int(frame_idx)): _frame_output_summary(outputs)
+            for frame_idx, outputs in sorted(non_cond_outputs.items(), key=lambda item: int(item[0]))
+        }
+    if isinstance(per_object, Mapping):
+        summary["per_object_output_frames"] = {}
+        for obj_idx, obj_outputs in list(per_object.items())[:16]:
+            if not isinstance(obj_outputs, Mapping):
+                continue
+            obj_cond = obj_outputs.get("cond_frame_outputs", {})
+            obj_non_cond = obj_outputs.get("non_cond_frame_outputs", {})
+            summary["per_object_output_frames"][str(obj_idx)] = {
+                "cond": sorted(int(frame_idx) for frame_idx in obj_cond) if isinstance(obj_cond, Mapping) else [],
+                "non_cond": sorted(int(frame_idx) for frame_idx in obj_non_cond) if isinstance(obj_non_cond, Mapping) else [],
+            }
+    return summary
 
 
 def run_sam3_video_with_mask_prompt(
