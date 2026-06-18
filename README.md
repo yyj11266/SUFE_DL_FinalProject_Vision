@@ -60,6 +60,23 @@ all first-frame objects from their complete masks, copies frame zero exactly,
 keeps object IDs fixed, saves native presence/IoU fields when exposed, and
 never falls back to points or SAM2.
 
+Before a full SAM 3.1 run, probe the official full predictor state flow on one
+short real video:
+
+```bash
+python scripts/debug_sam31_api.py \
+  --data-root /content/sufe_data/video_dataset \
+  --output-dir /content/sufe_runs \
+  --experiment-id sam31_api_probe \
+  --checkpoint /path/to/sam3.1_multiplex.pt \
+  --sam3-repo-dir /content/facebookresearch_sam3 \
+  --video-id 2b827e3a \
+  --max-frames 5
+```
+
+This writes `logs/sam31_api_introspection.json` and
+`logs/sam31_state_probe.json` without creating a submission.
+
 Create the frozen MOSEv2 split:
 
 ```bash
