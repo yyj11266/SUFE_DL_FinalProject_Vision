@@ -79,6 +79,12 @@ once on the 40-video holdout. Leaderboard video/object IDs are not tuning data.
 Do not use Google Drive as the experiment filesystem. Drive is only for inputs,
 compact review bundles, and optional single-file archives.
 
+Repository:
+
+```text
+https://github.com/yyj11266/SUFE_DL_FinalProject_Vision
+```
+
 Recommended layout:
 
 ```text
@@ -104,6 +110,23 @@ Recommended layout:
 2. Keep code on a local filesystem when possible, e.g. `/content/sufe_vos_leaderboard`.
 3. Set experiment output roots to `/content/sufe_runs`.
 4. Publish only a compact Codex review bundle back to Drive.
+
+When opening a notebook directly in Colab, run its first setup cell before any
+experiment cells. The setup cell clones this repository into
+`/content/sufe_vos_leaderboard` when it is not already present. You can also
+run the bootstrap manually:
+
+```python
+from google.colab import drive
+drive.mount("/content/drive")
+
+import pathlib, subprocess
+
+repo_url = "https://github.com/yyj11266/SUFE_DL_FinalProject_Vision.git"
+project_root = pathlib.Path("/content/sufe_vos_leaderboard")
+if not project_root.exists():
+    subprocess.run(["git", "clone", repo_url, str(project_root)], check=True)
+```
 
 If your folder is mounted somewhere else, set `SUFE_PROJECT_ROOT` to the folder
 containing `src/` before rerunning the first notebook cell.
