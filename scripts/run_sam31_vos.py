@@ -69,6 +69,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--offload-video-to-cpu", action="store_true")
     parser.add_argument("--offload-state-to-cpu", action="store_true")
+    parser.add_argument(
+        "--disable-internal-tracker-recovery",
+        action="store_true",
+        help="Development only; do not recover missing full-predictor objects from internal SAM2 tracker logits.",
+    )
     parser.add_argument("--save-native-scores", action="store_true")
     parser.add_argument("--save-raw-logits", action="store_true")
     parser.add_argument(
@@ -563,7 +568,10 @@ def main(argv: list[str] | None = None) -> int:
         "prompt_mode": "mask",
         "original_resolution": True,
         "first_frame_policy": "copy_input_annotation_exactly",
-        "fallback_policy": "fail_without_fallback",
+        "fallback_policy": "recover_internal_tracker_logits_before_quality_gate"
+        if not args.disable_internal_tracker_recovery
+        else "fail_without_fallback",
+        "internal_tracker_recovery_enabled": not args.disable_internal_tracker_recovery,
         "native_scores_requested": bool(args.save_native_scores),
         "save_overlays": args.save_overlays,
         "overlay_stride": args.overlay_stride,
@@ -617,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
                 "max_frames": args.max_frames,
                 "offload_video_to_cpu": args.offload_video_to_cpu,
                 "offload_state_to_cpu": args.offload_state_to_cpu,
+                "sam3_recover_internal_tracker_outputs": not args.disable_internal_tracker_recovery,
                 "save_native_scores": args.save_native_scores,
                 "save_raw_logits": args.save_raw_logits,
                 "save_overlays": args.save_overlays,

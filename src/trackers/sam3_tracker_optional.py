@@ -1374,6 +1374,82 @@ def _frame_full_native_output(state: Any, frame_idx: int) -> Mapping[str, Any]:
     return {}
 
 
+def _full_internal_tracker_outputs(
+    state: Any,
+    frame_idx: int,
+    expected_object_ids: Sequence[int],
+) -> tuple[list[int], np.ndarray, np.ndarray | None] | None:
+    """Recover SAM2 tracker logits from a full SAM 3.1 predictor state.
+
+    The full Object Multiplex predictor can drop all objects from its final
+    public output while the embedded SAM2 tracker still contains valid mask
+    logits. This diagnostic recovery stays inside the same full predictor
+    state and only succeeds when every expected object has an internal output.
+    """
+
+    if not isinstance(state, Mapping):
+        return None
+    tracker_states = state.get("sam2_inference_states", [])
+    if not isinstance(tracker_states, Sequence) or isinstance(tracker_states, (str, bytes)):
+        return None
+
+    expected = [int(object_id) for object_id in expected_object_ids]
+    expected_set = set(expected)
+    recovered_logits: dict[int, np.ndarray] = {}
+    recovered_scores: dict[int, float] = {}
+
+    for tracker_state in tracker_states:
+        if not isinstance(tracker_state, Mapping):
+            continue
+        output_dict = tracker_state.get("output_dict", {})
+        if not isinstance(output_dict, Mapping):
+            continue
+        frame_outputs = None
+        for storage_key in ("cond_frame_outputs", "non_cond_frame_outputs"):
+            storage = output_dict.get(storage_key, {})
+            if isinstance(storage, Mapping) and frame_idx in storage:
+                frame_outputs = storage[frame_idx]
+                break
+        if not isinstance(frame_outputs, Mapping):
+            continue
+        raw_masks = frame_outputs.get("pred_masks")
+        if raw_masks is None:
+            continue
+        logits = _to_numpy(raw_masks)
+        if logits.ndim == 4:
+            logits = logits[:, 0]
+        if logits.ndim == 2:
+            logits = logits[None]
+        if logits.ndim != 3:
+            continue
+
+        local_map = frame_outputs.get("local_obj_id_to_idx", {})
+        if not isinstance(local_map, Mapping) or not local_map:
+            obj_ids = tracker_state.get("obj_ids", [])
+            if isinstance(obj_ids, Sequence) and not isinstance(obj_ids, (str, bytes)):
+                local_map = {int(object_id): index for index, object_id in enumerate(obj_ids)}
+        raw_scores = frame_outputs.get("object_score_logits")
+        score_array = _to_numpy(raw_scores).reshape(-1) if raw_scores is not None else None
+
+        for object_id, local_index in local_map.items():
+            object_id = int(object_id)
+            local_index = int(local_index)
+            if object_id not in expected_set or local_index >= logits.shape[0]:
+                continue
+            recovered_logits[object_id] = logits[local_index]
+            if score_array is not None and local_index < score_array.size:
+                recovered_scores[object_id] = float(score_array[local_index])
+
+    missing = [object_id for object_id in expected if object_id not in recovered_logits]
+    if missing:
+        return None
+    stacked = np.stack([recovered_logits[object_id] for object_id in expected], axis=0)
+    scores = None
+    if recovered_scores:
+        scores = np.asarray([recovered_scores.get(object_id, -100.0) for object_id in expected], dtype=np.float32)
+    return expected, stacked, scores
+
+
 def _run_sam3_full_predictor_video_with_mask_prompt(
     video_info: Any,
     init_prompts: Iterable[Any],
@@ -1444,6 +1520,7 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
         previous_indexed: np.ndarray | None = None
         mask_conditioning_info: dict[str, Any] = {}
         diagnostics = _init_object_diagnostics(object_ids, target_frame_count, allow_missing_objects=True)
+        recovery_events: list[dict[str, Any]] = []
 
         with torch.inference_mode(), autocast:
             _set_full_predictor_tracking_bounds(state, 0, target_frame_count - 1)
@@ -1465,6 +1542,26 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
                 if frame_idx in seen_frames:
                     raise RuntimeError(f"SAM 3.1 returned frame {frame_idx} more than once")
                 raw_output_ids = list(output_ids)
+                missing_before_recovery = sorted(set(object_ids) - set(raw_output_ids))
+                if (
+                    missing_before_recovery
+                    and bool(config.get("sam3_recover_internal_tracker_outputs", True))
+                ):
+                    recovered = _full_internal_tracker_outputs(state, frame_idx, object_ids)
+                    if recovered is not None:
+                        recovered_ids, recovered_logits, recovered_scores = recovered
+                        recovery_events.append(
+                            {
+                                "frame_index": int(frame_idx),
+                                "original_output_object_ids": [int(object_id) for object_id in raw_output_ids],
+                                "missing_before_recovery": [int(object_id) for object_id in missing_before_recovery],
+                                "recovered_object_ids": [int(object_id) for object_id in recovered_ids],
+                            }
+                        )
+                        output_ids = recovered_ids
+                        logits = recovered_logits
+                        object_scores = recovered_scores
+                        raw_output_ids = list(recovered_ids)
                 logits = _reorder_objects(logits, output_ids, object_ids, allow_missing=True)
                 object_scores = _reorder_scores(object_scores, output_ids, object_ids, allow_missing=True)
                 _record_object_diagnostics(diagnostics, frame_idx, object_ids, raw_output_ids, logits, object_scores)
@@ -1512,10 +1609,17 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             raise RuntimeError("Saved first-frame mask is not pixel-identical to the input annotation")
 
         diagnostics = _finalize_object_diagnostics(diagnostics)
+        diagnostics["internal_tracker_recovery_events"] = recovery_events
+        diagnostics["internal_tracker_recovery_frames"] = len(recovery_events)
         if diagnostics.get("total_missing_output_frames"):
             warnings.append(
                 "The official SAM 3.1 full predictor omitted expected object IDs in "
                 f"{diagnostics['total_missing_output_frames']} frame/object case(s); see diagnostics."
+            )
+        if recovery_events:
+            warnings.append(
+                "Recovered omitted SAM 3.1 full-predictor objects from internal SAM2 tracker logits in "
+                f"{len(recovery_events)} frame(s); keep quality gates enabled."
             )
 
         version = _runtime_version(model)
@@ -1543,6 +1647,7 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             native_scores_path=str(scores_path) if config.get("save_native_scores") else None,
             native_state_path=str(state_path) if config.get("save_native_scores") else None,
             warnings=warnings,
+            fallback_used=bool(recovery_events),
             first_frame_exact=True,
             diagnostics=diagnostics,
         )

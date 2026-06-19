@@ -100,7 +100,15 @@ class FakeFullSam31Model:
         self.conditioned_ids = list(new_obj_ids)
         self.conditioned_masks = new_obj_masks.detach().float().cpu()
         self.assert_mask_like(new_obj_masks)
-        tracker_states_local.append({"obj_ids": list(new_obj_ids), "frame_idx": frame_idx, "num_frames": num_frames})
+        tracker_states_local.append(
+            {
+                "obj_ids": list(new_obj_ids),
+                "frame_idx": frame_idx,
+                "num_frames": num_frames,
+                "output_dict": {"cond_frame_outputs": {}, "non_cond_frame_outputs": {}},
+                "output_dict_per_obj": {},
+            }
+        )
         return tracker_states_local
 
     @staticmethod
@@ -151,7 +159,18 @@ class FakeFullSam31Model:
         assert self.conditioned_masks is not None
         object_ids = list(self.conditioned_ids)
         masks = self.conditioned_masks > 0
+        sam2_state = inference_state["sam2_inference_states"][0]
+        assert isinstance(sam2_state, dict)
+        output_dict = sam2_state["output_dict"]
+        assert isinstance(output_dict, dict)
         for frame_index in range(start_frame_idx, max_frame_num_to_track + 1):
+            internal_logits = torch.where(masks, torch.tensor(8.0), torch.tensor(-8.0)).unsqueeze(1)
+            storage_key = "cond_frame_outputs" if frame_index == 0 else "non_cond_frame_outputs"
+            output_dict[storage_key][frame_index] = {
+                "pred_masks": internal_logits,
+                "object_score_logits": torch.full((len(object_ids), 1), 4.0),
+                "local_obj_id_to_idx": {int(object_id): index for index, object_id in enumerate(object_ids)},
+            }
             frame_object_ids = list(object_ids)
             if self.drop_object_after_frame is not None and frame_index >= self.drop_object_after_frame and len(frame_object_ids) > 1:
                 frame_object_ids = frame_object_ids[:-1]
@@ -324,6 +343,7 @@ class Sam31AdapterTest(unittest.TestCase):
                     "resize_long_side": 0,
                     "output_frame_stems": ["00000", "00001", "00002"],
                     "save_native_scores": True,
+                    "sam3_recover_internal_tracker_outputs": False,
                 },
             )
 
@@ -334,6 +354,38 @@ class Sam31AdapterTest(unittest.TestCase):
             object_two = result.diagnostics["per_object"]["2"]
             self.assertEqual(object_two["first_missing_output_frame"], 1)
             self.assertEqual(object_two["missing_output_frames"], 2)
+
+    def test_full_predictor_recovers_missing_ids_from_internal_tracker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video, prompts, annotation = self._video(root)
+            predictor = FakeFullSam31Predictor(FakeFullSam31Model(drop_object_after_frame=1))
+            result = run_sam3_video_with_mask_prompt(
+                video,
+                prompts,
+                root / "outputs",
+                {
+                    "data_root": str(root),
+                    "cache_dir": str(root / "cache"),
+                    "predictor": predictor,
+                    "device": "cpu",
+                    "sam3_run_mode": SAM3_RUN_MODE_FULL,
+                    "prompt_mode": "mask",
+                    "resize_long_side": 0,
+                    "output_frame_stems": ["00000", "00001", "00002"],
+                    "save_native_scores": True,
+                },
+            )
+
+            self.assertEqual(result.status, "done", result.error)
+            self.assertTrue(result.fallback_used)
+            self.assertEqual(result.diagnostics["total_missing_output_frames"], 0)
+            self.assertEqual(result.diagnostics["internal_tracker_recovery_frames"], 2)
+            self.assertTrue(result.diagnostics["internal_tracker_recovery_events"])
+            self.assertTrue(any("Recovered omitted SAM 3.1" in warning for warning in result.warnings))
+            self.assertTrue(np.array_equal(np.asarray(Image.open(result.mask_paths[0])), annotation))
+            recovered_mask = np.asarray(Image.open(result.mask_paths[1]))
+            self.assertEqual(set(np.unique(recovered_mask).tolist()), {0, 1, 2})
 
     def test_build_prefers_full_predictor_builder(self) -> None:
         fake_predictor = FakeFullSam31Predictor()

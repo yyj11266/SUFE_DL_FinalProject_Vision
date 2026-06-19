@@ -41,6 +41,7 @@ from src.trackers.sam3_tracker_optional import (
     SAM31_HF_REPO,
     SAM3_RUN_MODE_FULL,
     _call_supported,
+    _full_internal_tracker_outputs,
     _full_predictor_model,
     _init_full_predictor_mask_state,
     _initialize_native_state,
@@ -575,6 +576,29 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
             if frame_idx < 0 or frame_idx >= target_frame_count:
                 continue
             raw_output_ids = [int(object_id) for object_id in output_ids]
+            recovery_info: dict[str, Any] | None = None
+            recovered = None
+            missing_before_recovery = sorted(set(object_ids) - set(raw_output_ids))
+            if missing_before_recovery:
+                recovered = _full_internal_tracker_outputs(state, frame_idx, object_ids)
+                if recovered is not None:
+                    recovered_ids, recovered_logits, recovered_scores = recovered
+                    recovery_info = {
+                        "available": True,
+                        "recovered_object_ids": [int(object_id) for object_id in recovered_ids],
+                        "mask_shape": list(recovered_logits.shape),
+                        "per_object_positive_pixels": [
+                            int((recovered_logits[index] > 0).sum())
+                            for index in range(recovered_logits.shape[0])
+                        ],
+                        "object_score_logits": (
+                            [float(value) for value in recovered_scores.reshape(-1).tolist()]
+                            if recovered_scores is not None
+                            else None
+                        ),
+                    }
+                else:
+                    recovery_info = {"available": False}
             reordered_logits = _reorder_objects(logits, raw_output_ids, object_ids, allow_missing=True)
             reordered_scores = _reorder_scores(object_scores, raw_output_ids, object_ids, allow_missing=True)
             object_rows: list[dict[str, Any]] = []
@@ -603,6 +627,7 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
                     "raw_output_object_ids": raw_output_ids,
                     "missing_expected_object_ids": sorted(set(object_ids) - set(raw_output_ids)),
                     "extra_object_ids": sorted(set(raw_output_ids) - set(object_ids)),
+                    "internal_tracker_recovery": recovery_info,
                     "objects": object_rows,
                     "raw_item_type": type(item).__module__ + "." + type(item).__name__,
                 }
