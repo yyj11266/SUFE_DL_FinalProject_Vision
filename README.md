@@ -15,6 +15,7 @@ Implemented:
 - Strict SAM 3.1 Object Multiplex adapter: `src/trackers/sam3_tracker_optional.py`
 - Native SAM 3.1 runner: `scripts/run_sam31_vos.py`
 - SAM 3.1 Colab workflow: `notebooks/sufe_sam31_colab.ipynb`
+- Cutie Colab workflow: `notebooks/sufe_cutie_colab.ipynb`
 - Optional Cutie candidate adapter: `src/vos/cutie_optional.py`
 - Cutie candidate runner: `scripts/run_cutie_vos.py`
 - Conservative SAM2/Cutie object fusion runner: `scripts/run_sam2_cutie_fusion.py`
@@ -276,7 +277,11 @@ Outputs:
 
 Cutie is the next independent VOS candidate because its official scripting API
 accepts a first-frame indexed mask and propagates object IDs frame by frame.
-Install the official repository on Colab local disk, not inside Drive:
+Use `notebooks/sufe_cutie_colab.ipynb` for the recommended Colab workflow. It
+mounts Drive, pulls the latest repo, checks/extracts the dataset zip, runs smoke
+first, then exposes full Cutie, review publishing, and optional SAM2/Cutie
+fusion cells. Install the official repository on Colab local disk, not inside
+Drive:
 
 ```bash
 python /content/sufe_vos_leaderboard/scripts/run_cutie_vos.py \
@@ -438,6 +443,8 @@ The planned competition modules are configured in `configs/leaderboard_colab.yam
 ```text
 sufe_vos_leaderboard/
 ├── notebooks/sufe_leaderboard_colab.ipynb
+├── notebooks/sufe_cutie_colab.ipynb
+├── notebooks/sufe_sam31_colab.ipynb
 ├── configs/
 ├── src/data
 ├── src/prompts
