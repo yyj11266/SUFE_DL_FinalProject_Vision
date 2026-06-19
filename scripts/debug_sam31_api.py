@@ -639,6 +639,64 @@ def _build_full_predictor(args: argparse.Namespace, checkpoint: Path | None) -> 
     raise RuntimeError("SAM3 model_builder exposes neither build_sam3_multiplex_video_predictor nor build_sam3_predictor")
 
 
+def _patch_model_init_state_filter_kwargs(predictor: Any) -> dict[str, Any]:
+    """Patch the official high-level predictor/session mismatch if present.
+
+    Some SAM3.1 snapshots route ``offload_state_to_cpu`` through
+    ``BasePredictor.start_session`` even though the multiplex model's
+    ``init_state`` does not accept it. Filtering unsupported kwargs keeps the
+    probe on the official high-level session API without editing the external
+    SAM3 checkout.
+    """
+
+    model = getattr(predictor, "model", predictor)
+    original = getattr(model, "init_state", None)
+    if not callable(original):
+        return {
+            "diagnostic_patch_applied": False,
+            "diagnostic_patch": None,
+            "reason": "model_init_state_not_callable",
+        }
+    if getattr(model, "_sufe_filter_init_state_kwargs_patch", False):
+        return {
+            "diagnostic_patch_applied": True,
+            "diagnostic_patch": "filter_init_state_kwargs",
+            "reason": "already_applied",
+        }
+    try:
+        signature = inspect.signature(original)
+    except Exception as exc:
+        return {
+            "diagnostic_patch_applied": False,
+            "diagnostic_patch": None,
+            "reason": f"signature_unavailable:{type(exc).__name__}: {exc}",
+        }
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return {
+            "diagnostic_patch_applied": False,
+            "diagnostic_patch": None,
+            "reason": "init_state_accepts_var_kwargs",
+        }
+    accepted = set(signature.parameters)
+
+    def init_state_filter_kwargs(*args: Any, **kwargs: Any) -> Any:
+        filtered = {key: value for key, value in kwargs.items() if key in accepted}
+        return original(*args, **filtered)
+
+    try:
+        setattr(model, "init_state", init_state_filter_kwargs)
+        setattr(model, "_sufe_filter_init_state_kwargs_patch", True)
+    except Exception:
+        object.__setattr__(model, "init_state", init_state_filter_kwargs)
+        object.__setattr__(model, "_sufe_filter_init_state_kwargs_patch", True)
+    return {
+        "diagnostic_patch_applied": True,
+        "diagnostic_patch": "filter_init_state_kwargs",
+        "filtered_kwargs": ["offload_state_to_cpu"],
+        "accepted_init_state_kwargs": sorted(accepted),
+    }
+
+
 def _mask_center_and_box(mask: np.ndarray) -> tuple[list[float], list[float]]:
     ys, xs = np.nonzero(mask)
     if len(xs) == 0 or len(ys) == 0:
@@ -938,6 +996,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, ensure_ascii=True))
             return 1
 
+        patch_status = _patch_model_init_state_filter_kwargs(predictor)
         model = getattr(predictor, "model", predictor)
         audit = _checkpoint_full_model_audit(checkpoint, predictor)
         api_payload = {
@@ -953,6 +1012,8 @@ def main(argv: list[str] | None = None) -> int:
             "sam3_candidate_mode": "point_prompt_only",
             "private_state_used": False,
             "previous_mask_recovery": False,
+            "diagnostic_patch_applied": bool(patch_status.get("diagnostic_patch_applied")),
+            "diagnostic_patch": patch_status,
             "checkpoint_keys": _checkpoint_key_summary(checkpoint, model),
             "checkpoint_full_model_audit": audit,
             "model_state_keys": _model_state_key_summary(model),
@@ -992,6 +1053,8 @@ def main(argv: list[str] | None = None) -> int:
                 for object_id in inputs["object_ids"]
             },
             "checkpoint": str(checkpoint) if checkpoint else None,
+            "diagnostic_patch_applied": bool(patch_status.get("diagnostic_patch_applied")),
+            "diagnostic_patch": patch_status,
             "public_session_probe": _probe_public_session(
                 args,
                 predictor,
@@ -1047,6 +1110,8 @@ def main(argv: list[str] | None = None) -> int:
             "mask_api_path": None,
             "private_state_used": False,
             "previous_mask_recovery": False,
+            "diagnostic_patch_applied": bool(patch_status.get("diagnostic_patch_applied")),
+            "diagnostic_patch": patch_status.get("diagnostic_patch"),
             "checkpoint_audit_passed": bool(audit.get("passed")),
             "public_session_probe_status": public_session.get("status"),
             "public_session_maintained_expected_object_ids": public_session.get("maintained_expected_object_ids"),
