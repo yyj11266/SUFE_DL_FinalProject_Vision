@@ -32,6 +32,8 @@ from src.trackers.sam3_tracker_optional import (
     SAM31_HF_REPO,
     SAM3_EMPTY_MASK_POLICIES,
     SAM3_EMPTY_MASK_POLICY_EMPTY,
+    SAM3_INDEXED_ABSENCE_POLICIES,
+    SAM3_INDEXED_ABSENCE_POLICY_EMPTY,
     SAM3_RUN_MODE_FULL,
     SAM3_RUN_MODE_LOW_LEVEL,
     SAM3_RUN_MODES,
@@ -81,6 +83,12 @@ def _parser() -> argparse.ArgumentParser:
         default=SAM3_EMPTY_MASK_POLICY_EMPTY,
         choices=SAM3_EMPTY_MASK_POLICIES,
         help="Development diagnostic. 'previous' holds the previous object mask when SAM3 emits an empty mask.",
+    )
+    parser.add_argument(
+        "--sam3-indexed-absence-policy",
+        default=SAM3_INDEXED_ABSENCE_POLICY_EMPTY,
+        choices=SAM3_INDEXED_ABSENCE_POLICIES,
+        help="Development diagnostic. 'previous' restores a missing object after indexed-mask composition.",
     )
     parser.add_argument("--save-native-scores", action="store_true")
     parser.add_argument("--save-raw-logits", action="store_true")
@@ -581,6 +589,7 @@ def main(argv: list[str] | None = None) -> int:
         else "fail_without_fallback",
         "internal_tracker_recovery_enabled": not args.disable_internal_tracker_recovery,
         "empty_mask_policy": args.sam3_empty_mask_policy,
+        "indexed_absence_policy": args.sam3_indexed_absence_policy,
         "native_scores_requested": bool(args.save_native_scores),
         "save_overlays": args.save_overlays,
         "overlay_stride": args.overlay_stride,
@@ -636,6 +645,7 @@ def main(argv: list[str] | None = None) -> int:
                 "offload_state_to_cpu": args.offload_state_to_cpu,
                 "sam3_recover_internal_tracker_outputs": not args.disable_internal_tracker_recovery,
                 "sam3_empty_mask_policy": args.sam3_empty_mask_policy,
+                "sam3_indexed_absence_policy": args.sam3_indexed_absence_policy,
                 "save_native_scores": args.save_native_scores,
                 "save_raw_logits": args.save_raw_logits,
                 "save_overlays": args.save_overlays,

@@ -50,6 +50,9 @@ SAM3_RUN_MODES = (SAM3_RUN_MODE_FULL, SAM3_RUN_MODE_LOW_LEVEL)
 SAM3_EMPTY_MASK_POLICY_EMPTY = "empty"
 SAM3_EMPTY_MASK_POLICY_PREVIOUS = "previous"
 SAM3_EMPTY_MASK_POLICIES = (SAM3_EMPTY_MASK_POLICY_EMPTY, SAM3_EMPTY_MASK_POLICY_PREVIOUS)
+SAM3_INDEXED_ABSENCE_POLICY_EMPTY = "empty"
+SAM3_INDEXED_ABSENCE_POLICY_PREVIOUS = "previous"
+SAM3_INDEXED_ABSENCE_POLICIES = (SAM3_INDEXED_ABSENCE_POLICY_EMPTY, SAM3_INDEXED_ABSENCE_POLICY_PREVIOUS)
 MIN_PYTHON = (3, 12)
 MIN_TORCH = (2, 7)
 MIN_CUDA = (12, 6)
@@ -933,6 +936,51 @@ def _apply_empty_mask_policy(
     return updated, changed
 
 
+def _apply_indexed_absence_policy(
+    indexed_mask: np.ndarray,
+    object_ids: list[int],
+    frame_idx: int,
+    previous_indexed_mask: np.ndarray | None,
+    policy: str,
+    events: list[dict[str, Any]],
+) -> tuple[np.ndarray, bool]:
+    """Restore objects that disappear only after indexed-mask composition."""
+
+    normalized_policy = str(policy or SAM3_INDEXED_ABSENCE_POLICY_EMPTY).lower()
+    if normalized_policy not in SAM3_INDEXED_ABSENCE_POLICIES:
+        raise ValueError(f"Unsupported SAM 3.1 indexed absence policy: {policy}")
+    if normalized_policy == SAM3_INDEXED_ABSENCE_POLICY_EMPTY or frame_idx <= 0 or previous_indexed_mask is None:
+        return indexed_mask, False
+
+    current = np.asarray(indexed_mask, dtype=np.uint8).copy()
+    previous = np.asarray(previous_indexed_mask, dtype=np.uint8)
+    if previous.shape[:2] != current.shape[:2]:
+        previous = _resize_mask(previous, current.shape[1], current.shape[0])
+
+    changed = False
+    for object_id in object_ids:
+        object_id = int(object_id)
+        if bool(np.any(current == object_id)):
+            continue
+        restore = previous == object_id
+        if not bool(np.any(restore)):
+            continue
+        overwritten_ids = sorted(int(value) for value in np.unique(current[restore]).tolist() if int(value) != object_id)
+        current[restore] = np.uint8(min(max(object_id, 0), 255))
+        changed = True
+        events.append(
+            {
+                "frame_index": int(frame_idx),
+                "object_id": object_id,
+                "policy": normalized_policy,
+                "source": "previous_indexed_mask_after_composition",
+                "foreground_pixels": int(np.count_nonzero(restore)),
+                "overwritten_object_ids": overwritten_ids,
+            }
+        )
+    return current, changed
+
+
 def _init_object_diagnostics(object_ids: list[int], frame_count: int, allow_missing_objects: bool) -> dict[str, Any]:
     return {
         "frame_count": int(frame_count),
@@ -1545,6 +1593,9 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
         empty_mask_policy = str(config.get("sam3_empty_mask_policy", SAM3_EMPTY_MASK_POLICY_EMPTY)).lower()
         if empty_mask_policy not in SAM3_EMPTY_MASK_POLICIES:
             raise ValueError(f"Unsupported SAM 3.1 empty mask policy: {empty_mask_policy}")
+        indexed_absence_policy = str(config.get("sam3_indexed_absence_policy", SAM3_INDEXED_ABSENCE_POLICY_EMPTY)).lower()
+        if indexed_absence_policy not in SAM3_INDEXED_ABSENCE_POLICIES:
+            raise ValueError(f"Unsupported SAM 3.1 indexed absence policy: {indexed_absence_policy}")
 
         prepared_frames = _prepare_frame_dir(video_info, config)
         max_frames = int(config.get("max_frames", 0) or 0)
@@ -1591,6 +1642,7 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
         diagnostics = _init_object_diagnostics(object_ids, target_frame_count, allow_missing_objects=True)
         recovery_events: list[dict[str, Any]] = []
         empty_policy_events: list[dict[str, Any]] = []
+        indexed_absence_events: list[dict[str, Any]] = []
 
         with torch.inference_mode(), autocast:
             _set_full_predictor_tracking_bounds(state, 0, target_frame_count - 1)
@@ -1650,6 +1702,14 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
                 else:
                     indexed = _compose_indexed_mask(logits, object_ids, previous_indexed)
                     indexed = _resize_mask(indexed, frame.original_width, frame.original_height)
+                    indexed, _ = _apply_indexed_absence_policy(
+                        indexed,
+                        object_ids,
+                        frame_idx,
+                        previous_indexed,
+                        indexed_absence_policy,
+                        indexed_absence_events,
+                    )
                 illegal = sorted(set(int(value) for value in np.unique(indexed)) - {0, *object_ids})
                 if illegal:
                     raise RuntimeError(f"Frame {frame_idx} contains unexpected object IDs: {illegal}")
@@ -1692,6 +1752,9 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
         diagnostics["empty_mask_policy"] = empty_mask_policy
         diagnostics["empty_mask_policy_events"] = empty_policy_events
         diagnostics["empty_mask_policy_frames"] = len({int(event["frame_index"]) for event in empty_policy_events})
+        diagnostics["indexed_absence_policy"] = indexed_absence_policy
+        diagnostics["indexed_absence_policy_events"] = indexed_absence_events
+        diagnostics["indexed_absence_policy_frames"] = len({int(event["frame_index"]) for event in indexed_absence_events})
         if diagnostics.get("total_missing_output_frames"):
             warnings.append(
                 "The official SAM 3.1 full predictor omitted expected object IDs in "
@@ -1707,6 +1770,12 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
                 "Applied SAM 3.1 empty-mask policy "
                 f"{empty_mask_policy!r} to {len(empty_policy_events)} frame/object case(s); "
                 "treat this as a diagnostic stabilization experiment."
+            )
+        if indexed_absence_events:
+            warnings.append(
+                "Applied SAM 3.1 indexed-absence policy "
+                f"{indexed_absence_policy!r} to {len(indexed_absence_events)} frame/object case(s); "
+                "treat this as a diagnostic identity-preservation experiment."
             )
 
         version = _runtime_version(model)
@@ -1734,7 +1803,7 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             native_scores_path=str(scores_path) if config.get("save_native_scores") else None,
             native_state_path=str(state_path) if config.get("save_native_scores") else None,
             warnings=warnings,
-            fallback_used=bool(recovery_events or empty_policy_events),
+            fallback_used=bool(recovery_events or empty_policy_events or indexed_absence_events),
             first_frame_exact=True,
             diagnostics=diagnostics,
         )

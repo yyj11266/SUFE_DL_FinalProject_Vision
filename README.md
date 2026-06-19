@@ -80,8 +80,11 @@ The Colab notebook also copies these probe JSON files to
 `MyDrive/sufe_vos_review/runs/EXP_ID/` for Codex review.
 For a diagnostic smoke rerun after an empty-mask collapse, set
 `SAM31_EMPTY_MASK_POLICY=previous` in Colab. This holds the previous object mask
-only when SAM3.1 emits an empty object mask, records every event in diagnostics,
-and should not be treated as a submission policy without contact-sheet review.
+only when SAM3.1 emits an empty object mask. The smoke notebook then defaults
+`SAM31_INDEXED_ABSENCE_POLICY` to the same value, which also restores an object
+if it disappears only after indexed-mask composition. Both policies record every
+event in diagnostics and should not be treated as submission policies without
+contact-sheet review.
 
 Create the frozen MOSEv2 split:
 
