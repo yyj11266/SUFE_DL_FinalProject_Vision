@@ -47,6 +47,9 @@ SAM31_CHECKPOINT_NAME = "sam3.1_multiplex.pt"
 SAM3_RUN_MODE_FULL = "full_predictor_mask"
 SAM3_RUN_MODE_LOW_LEVEL = "low_level_debug"
 SAM3_RUN_MODES = (SAM3_RUN_MODE_FULL, SAM3_RUN_MODE_LOW_LEVEL)
+SAM3_EMPTY_MASK_POLICY_EMPTY = "empty"
+SAM3_EMPTY_MASK_POLICY_PREVIOUS = "previous"
+SAM3_EMPTY_MASK_POLICIES = (SAM3_EMPTY_MASK_POLICY_EMPTY, SAM3_EMPTY_MASK_POLICY_PREVIOUS)
 MIN_PYTHON = (3, 12)
 MIN_TORCH = (2, 7)
 MIN_CUDA = (12, 6)
@@ -867,6 +870,69 @@ def _reorder_scores(
     return np.asarray([scores[positions[object_id]] if object_id in positions else -100.0 for object_id in expected_ids], dtype=np.float32)
 
 
+def _previous_indexed_object_logit(
+    previous_indexed_mask: np.ndarray,
+    object_id: int,
+    target_shape: tuple[int, int],
+) -> np.ndarray | None:
+    """Return a small positive/negative logit plane from the previous indexed mask."""
+
+    previous_binary = np.asarray(previous_indexed_mask) == int(object_id)
+    if not bool(previous_binary.any()):
+        return None
+    target_height, target_width = int(target_shape[0]), int(target_shape[1])
+    resized = _resize_mask(previous_binary.astype(np.uint8), target_width, target_height) > 0
+    if not bool(resized.any()):
+        ys, xs = np.nonzero(previous_binary)
+        source_height, source_width = previous_binary.shape[:2]
+        y0 = max(0, min(target_height - 1, int(math.floor(float(ys.min()) * target_height / source_height))))
+        y1 = max(y0 + 1, min(target_height, int(math.ceil(float(ys.max() + 1) * target_height / source_height))))
+        x0 = max(0, min(target_width - 1, int(math.floor(float(xs.min()) * target_width / source_width))))
+        x1 = max(x0 + 1, min(target_width, int(math.ceil(float(xs.max() + 1) * target_width / source_width))))
+        resized[y0:y1, x0:x1] = True
+    logits = np.full((target_height, target_width), -1.0, dtype=np.float32)
+    logits[resized] = 1.0
+    return logits
+
+
+def _apply_empty_mask_policy(
+    logits: np.ndarray,
+    object_ids: list[int],
+    frame_idx: int,
+    previous_indexed_mask: np.ndarray | None,
+    policy: str,
+    events: list[dict[str, Any]],
+) -> tuple[np.ndarray, bool]:
+    """Apply an explicit diagnostic policy for empty per-object SAM3 masks."""
+
+    normalized_policy = str(policy or SAM3_EMPTY_MASK_POLICY_EMPTY).lower()
+    if normalized_policy not in SAM3_EMPTY_MASK_POLICIES:
+        raise ValueError(f"Unsupported SAM 3.1 empty mask policy: {policy}")
+    if normalized_policy == SAM3_EMPTY_MASK_POLICY_EMPTY or frame_idx <= 0 or previous_indexed_mask is None:
+        return logits, False
+
+    updated = np.asarray(logits, dtype=np.float32).copy()
+    changed = False
+    for index, object_id in enumerate(object_ids):
+        if index >= updated.shape[0] or bool(np.any(updated[index] > 0)):
+            continue
+        replacement = _previous_indexed_object_logit(previous_indexed_mask, object_id, updated[index].shape)
+        if replacement is None:
+            continue
+        updated[index] = replacement
+        changed = True
+        events.append(
+            {
+                "frame_index": int(frame_idx),
+                "object_id": int(object_id),
+                "policy": normalized_policy,
+                "source": "previous_indexed_mask",
+                "foreground_pixels": int(np.count_nonzero(replacement > 0)),
+            }
+        )
+    return updated, changed
+
+
 def _init_object_diagnostics(object_ids: list[int], frame_count: int, allow_missing_objects: bool) -> dict[str, Any]:
     return {
         "frame_count": int(frame_count),
@@ -1476,6 +1542,9 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             raise ValueError("SAM 3.1 full predictor baseline only supports --prompt-mode mask")
         if int(config.get("resize_long_side", 0) or 0) != 0:
             raise ValueError("SAM 3.1 full predictor baseline requires original resolution")
+        empty_mask_policy = str(config.get("sam3_empty_mask_policy", SAM3_EMPTY_MASK_POLICY_EMPTY)).lower()
+        if empty_mask_policy not in SAM3_EMPTY_MASK_POLICIES:
+            raise ValueError(f"Unsupported SAM 3.1 empty mask policy: {empty_mask_policy}")
 
         prepared_frames = _prepare_frame_dir(video_info, config)
         max_frames = int(config.get("max_frames", 0) or 0)
@@ -1521,6 +1590,7 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
         mask_conditioning_info: dict[str, Any] = {}
         diagnostics = _init_object_diagnostics(object_ids, target_frame_count, allow_missing_objects=True)
         recovery_events: list[dict[str, Any]] = []
+        empty_policy_events: list[dict[str, Any]] = []
 
         with torch.inference_mode(), autocast:
             _set_full_predictor_tracking_bounds(state, 0, target_frame_count - 1)
@@ -1564,6 +1634,14 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
                         raw_output_ids = list(recovered_ids)
                 logits = _reorder_objects(logits, output_ids, object_ids, allow_missing=True)
                 object_scores = _reorder_scores(object_scores, output_ids, object_ids, allow_missing=True)
+                logits, _ = _apply_empty_mask_policy(
+                    logits,
+                    object_ids,
+                    frame_idx,
+                    previous_indexed,
+                    empty_mask_policy,
+                    empty_policy_events,
+                )
                 _record_object_diagnostics(diagnostics, frame_idx, object_ids, raw_output_ids, logits, object_scores)
                 frame = prepared_frames[frame_idx]
 
@@ -1611,6 +1689,9 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
         diagnostics = _finalize_object_diagnostics(diagnostics)
         diagnostics["internal_tracker_recovery_events"] = recovery_events
         diagnostics["internal_tracker_recovery_frames"] = len(recovery_events)
+        diagnostics["empty_mask_policy"] = empty_mask_policy
+        diagnostics["empty_mask_policy_events"] = empty_policy_events
+        diagnostics["empty_mask_policy_frames"] = len({int(event["frame_index"]) for event in empty_policy_events})
         if diagnostics.get("total_missing_output_frames"):
             warnings.append(
                 "The official SAM 3.1 full predictor omitted expected object IDs in "
@@ -1620,6 +1701,12 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             warnings.append(
                 "Recovered omitted SAM 3.1 full-predictor objects from internal SAM2 tracker logits in "
                 f"{len(recovery_events)} frame(s); keep quality gates enabled."
+            )
+        if empty_policy_events:
+            warnings.append(
+                "Applied SAM 3.1 empty-mask policy "
+                f"{empty_mask_policy!r} to {len(empty_policy_events)} frame/object case(s); "
+                "treat this as a diagnostic stabilization experiment."
             )
 
         version = _runtime_version(model)
@@ -1647,7 +1734,7 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             native_scores_path=str(scores_path) if config.get("save_native_scores") else None,
             native_state_path=str(state_path) if config.get("save_native_scores") else None,
             warnings=warnings,
-            fallback_used=bool(recovery_events),
+            fallback_used=bool(recovery_events or empty_policy_events),
             first_frame_exact=True,
             diagnostics=diagnostics,
         )

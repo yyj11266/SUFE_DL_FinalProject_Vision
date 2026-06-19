@@ -30,6 +30,8 @@ from src.data.submission import (
 )
 from src.trackers.sam3_tracker_optional import (
     SAM31_HF_REPO,
+    SAM3_EMPTY_MASK_POLICIES,
+    SAM3_EMPTY_MASK_POLICY_EMPTY,
     SAM3_RUN_MODE_FULL,
     SAM3_RUN_MODE_LOW_LEVEL,
     SAM3_RUN_MODES,
@@ -73,6 +75,12 @@ def _parser() -> argparse.ArgumentParser:
         "--disable-internal-tracker-recovery",
         action="store_true",
         help="Development only; do not recover missing full-predictor objects from internal SAM2 tracker logits.",
+    )
+    parser.add_argument(
+        "--sam3-empty-mask-policy",
+        default=SAM3_EMPTY_MASK_POLICY_EMPTY,
+        choices=SAM3_EMPTY_MASK_POLICIES,
+        help="Development diagnostic. 'previous' holds the previous object mask when SAM3 emits an empty mask.",
     )
     parser.add_argument("--save-native-scores", action="store_true")
     parser.add_argument("--save-raw-logits", action="store_true")
@@ -572,6 +580,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.disable_internal_tracker_recovery
         else "fail_without_fallback",
         "internal_tracker_recovery_enabled": not args.disable_internal_tracker_recovery,
+        "empty_mask_policy": args.sam3_empty_mask_policy,
         "native_scores_requested": bool(args.save_native_scores),
         "save_overlays": args.save_overlays,
         "overlay_stride": args.overlay_stride,
@@ -626,6 +635,7 @@ def main(argv: list[str] | None = None) -> int:
                 "offload_video_to_cpu": args.offload_video_to_cpu,
                 "offload_state_to_cpu": args.offload_state_to_cpu,
                 "sam3_recover_internal_tracker_outputs": not args.disable_internal_tracker_recovery,
+                "sam3_empty_mask_policy": args.sam3_empty_mask_policy,
                 "save_native_scores": args.save_native_scores,
                 "save_raw_logits": args.save_raw_logits,
                 "save_overlays": args.save_overlays,

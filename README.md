@@ -78,6 +78,10 @@ This writes `logs/sam31_api_introspection.json` and
 `logs/sam31_state_probe.json` without creating a submission.
 The Colab notebook also copies these probe JSON files to
 `MyDrive/sufe_vos_review/runs/EXP_ID/` for Codex review.
+For a diagnostic smoke rerun after an empty-mask collapse, set
+`SAM31_EMPTY_MASK_POLICY=previous` in Colab. This holds the previous object mask
+only when SAM3.1 emits an empty object mask, records every event in diagnostics,
+and should not be treated as a submission policy without contact-sheet review.
 
 Create the frozen MOSEv2 split:
 

@@ -57,7 +57,7 @@ class FakeNativeSam31:
 
 
 class FakeFullSam31Model:
-    def __init__(self, drop_object_after_frame: int | None = None) -> None:
+    def __init__(self, drop_object_after_frame: int | None = None, empty_internal_after_frame: int | None = None) -> None:
         self.device = torch.device("cpu")
         self.rank = 0
         self.world_size = 1
@@ -68,6 +68,7 @@ class FakeFullSam31Model:
         self.conditioned_ids: list[int] = []
         self.cache_calls: list[int] = []
         self.drop_object_after_frame = drop_object_after_frame
+        self.empty_internal_after_frame = empty_internal_after_frame
 
     def init_state(self, resource_path: str, **_: object) -> dict[str, object]:
         frame_count = len(list(Path(resource_path).glob("*.jpg")))
@@ -164,7 +165,10 @@ class FakeFullSam31Model:
         output_dict = sam2_state["output_dict"]
         assert isinstance(output_dict, dict)
         for frame_index in range(start_frame_idx, max_frame_num_to_track + 1):
-            internal_logits = torch.where(masks, torch.tensor(8.0), torch.tensor(-8.0)).unsqueeze(1)
+            internal_masks = masks
+            if self.empty_internal_after_frame is not None and frame_index >= self.empty_internal_after_frame:
+                internal_masks = torch.zeros_like(masks, dtype=torch.bool)
+            internal_logits = torch.where(internal_masks, torch.tensor(8.0), torch.tensor(-8.0)).unsqueeze(1)
             storage_key = "cond_frame_outputs" if frame_index == 0 else "non_cond_frame_outputs"
             output_dict[storage_key][frame_index] = {
                 "pred_masks": internal_logits,
@@ -386,6 +390,47 @@ class Sam31AdapterTest(unittest.TestCase):
             self.assertTrue(np.array_equal(np.asarray(Image.open(result.mask_paths[0])), annotation))
             recovered_mask = np.asarray(Image.open(result.mask_paths[1]))
             self.assertEqual(set(np.unique(recovered_mask).tolist()), {0, 1, 2})
+
+    def test_full_predictor_previous_policy_fills_empty_recovered_masks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video, prompts, annotation = self._video(root)
+            predictor = FakeFullSam31Predictor(
+                FakeFullSam31Model(drop_object_after_frame=1, empty_internal_after_frame=1)
+            )
+            result = run_sam3_video_with_mask_prompt(
+                video,
+                prompts,
+                root / "outputs",
+                {
+                    "data_root": str(root),
+                    "cache_dir": str(root / "cache"),
+                    "predictor": predictor,
+                    "device": "cpu",
+                    "sam3_run_mode": SAM3_RUN_MODE_FULL,
+                    "prompt_mode": "mask",
+                    "resize_long_side": 0,
+                    "output_frame_stems": ["00000", "00001", "00002"],
+                    "sam3_empty_mask_policy": "previous",
+                    "save_native_scores": True,
+                },
+            )
+
+            self.assertEqual(result.status, "done", result.error)
+            self.assertTrue(result.fallback_used)
+            self.assertEqual(result.diagnostics["total_missing_output_frames"], 0)
+            self.assertEqual(result.diagnostics["empty_mask_policy"], "previous")
+            self.assertEqual(result.diagnostics["empty_mask_policy_frames"], 2)
+            self.assertEqual(len(result.diagnostics["empty_mask_policy_events"]), 4)
+            self.assertEqual(
+                {event["object_id"] for event in result.diagnostics["empty_mask_policy_events"]},
+                {1, 2},
+            )
+            self.assertEqual(result.diagnostics["per_object"]["2"]["non_first_zero_frames"], 0)
+            self.assertTrue(any("empty-mask policy" in warning for warning in result.warnings))
+            self.assertTrue(np.array_equal(np.asarray(Image.open(result.mask_paths[0])), annotation))
+            stabilized_mask = np.asarray(Image.open(result.mask_paths[1]))
+            self.assertEqual(set(np.unique(stabilized_mask).tolist()), {0, 1, 2})
 
     def test_build_prefers_full_predictor_builder(self) -> None:
         fake_predictor = FakeFullSam31Predictor()
