@@ -43,7 +43,7 @@ from src.trackers.sam2_tracker import (
 
 
 SAM3_REPO_URL = "https://github.com/facebookresearch/sam3.git"
-SAM31_HF_REPO = "facebook/sam3.1"
+SAM31_HF_REPO = "research21/sam3.1"
 SAM31_CHECKPOINT_NAME = "sam3.1_multiplex.pt"
 SAM3_RUN_MODE_OFFICIAL = "official_mask_api"
 SAM3_RUN_MODE_FULL = "full_predictor_mask"
@@ -261,7 +261,7 @@ def check_sam3_available(
             errors.append(f"SAM 3.1 checkpoint is missing or empty: {checkpoint}")
     hf_token_present = _hf_token_present()
     if not checkpoint_path and not hf_token_present:
-        warnings.append(f"No local checkpoint and no Hugging Face token; gated repo {SAM31_HF_REPO} requires access.")
+        warnings.append(f"No local checkpoint and no Hugging Face token; default repo {SAM31_HF_REPO} will be used if public.")
 
     if not strict_runtime:
         runtime_errors = [

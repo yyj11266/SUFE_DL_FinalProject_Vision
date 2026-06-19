@@ -40,8 +40,10 @@ Recommended runtime:
 - T4 is unsupported for the full run
 
 Required runtime: Python 3.12+, PyTorch 2.7+, CUDA 12.6+, and a BF16 GPU.
-The notebook defaults to the gated `facebook/sam3.1` checkpoint repository; set
-`HF_TOKEN` or override `SAM31_HF_REPO_ID` only for a deliberate mirror test.
+The notebook defaults to the previously used `research21/sam3.1` checkpoint
+mirror so Colab can run without Hugging Face gated access. For an official
+checkpoint check, set `SAM31_HF_REPO_ID=facebook/sam3.1` and provide
+`HF_TOKEN`.
 
 ```bash
 python scripts/debug_sam31_api.py \
