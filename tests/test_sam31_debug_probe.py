@@ -86,14 +86,31 @@ def test_mask_probe_summary_reports_early_object_collapse() -> None:
 def test_mask_probe_summary_preserves_missing_api_status() -> None:
     summary = _mask_probe_summary(
         {
-            "status": "blocked_missing_official_mask_api",
-            "api_path": "full_predictor_model.add_new_masks",
+            "status": "blocked_missing_low_level_add_new_masks",
+            "api_path": "build_sam3_multiplex_video_model.add_new_masks",
             "error": "model does not expose add_new_masks",
         }
     )
 
     assert summary == {
-        "status": "blocked_missing_official_mask_api",
+        "status": "blocked_missing_low_level_add_new_masks",
+        "maintained_expected_object_ids": False,
+        "first_missing_frame": None,
+        "empty_non_initial_frames": None,
+    }
+
+
+def test_mask_probe_summary_preserves_strict_load_failure_status() -> None:
+    summary = _mask_probe_summary(
+        {
+            "status": "blocked_low_level_builder_strict_load_failed",
+            "api_path": "build_sam3_multiplex_video_model.add_new_masks",
+            "error": "missing checkpoint keys",
+        }
+    )
+
+    assert summary == {
+        "status": "blocked_low_level_builder_strict_load_failed",
         "maintained_expected_object_ids": False,
         "first_missing_frame": None,
         "empty_non_initial_frames": None,

@@ -42,6 +42,7 @@ from src.trackers.sam2_tracker import (
 from src.trackers.sam3_tracker_optional import (
     SAM31_CHECKPOINT_NAME,
     SAM31_HF_REPO,
+    SAM3_RUN_MODE_OFFICIAL,
     _call_supported,
     _initialize_native_state,
     _normalize_propagation_item,
@@ -51,6 +52,7 @@ from src.trackers.sam3_tracker_optional import (
     _session_frame_dir,
     _sigmoid,
     _state_summary,
+    build_sam3_tracker,
     install_sam3_if_requested,
 )
 
@@ -868,6 +870,9 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
 
     mask_tensor = torch.from_numpy(np.stack([object_masks[object_id] for object_id in object_ids])).bool()
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    model_device = getattr(model, "device", None)
+    if model_device is not None:
+        mask_tensor = mask_tensor.to(model_device)
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.startswith("cuda") else torch.no_grad()
     propagation_rows: list[dict[str, Any]] = []
     conditioning_info: dict[str, Any] = {}
@@ -887,6 +892,22 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
             "private_state_used": False,
         }
         snapshots.append(_state_snapshot(state, object_ids, model, "after_mask_conditioning"))
+        preflight = getattr(model, "propagate_in_video_preflight", None)
+        if not callable(preflight):
+            raise RuntimeError("SAM 3.1 low-level model is missing propagate_in_video_preflight")
+        _call_supported(
+            preflight,
+            inference_state=state,
+            run_mem_encoder=True,
+            start_frame_idx=0,
+            max_frame_num_to_track=target_frame_count - 1,
+            reverse=False,
+        )
+        conditioning_info["propagate_in_video_preflight"] = {
+            "called": True,
+            "run_mem_encoder": True,
+        }
+        snapshots.append(_state_snapshot(state, object_ids, model, "after_propagation_preflight"))
         propagation = _call_supported(
             model.propagate_in_video,
             inference_state=state,
@@ -949,7 +970,7 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
 
     return {
         "status": "done",
-        "api_path": "full_predictor_model.add_new_masks",
+        "api_path": "build_sam3_multiplex_video_model.add_new_masks",
         "video_id": video.video_id,
         "target_frame_count": target_frame_count,
         "frame_dir": str(frame_dir),
@@ -1051,7 +1072,7 @@ def main(argv: list[str] | None = None) -> int:
             "sam3_checkpoint_load_target": "full_multiplex_predictor",
             "sam3_submission_status": "blocked_public_mask_session_api",
             "sam3_public_mask_request": False,
-            "sam3_low_level_add_new_masks": True,
+            "sam3_low_level_add_new_masks": False,
             "sam3_low_level_standalone_video_api": False,
             "sam3_candidate_mode": "point_prompt_only",
             "private_state_used": False,
@@ -1112,31 +1133,60 @@ def main(argv: list[str] | None = None) -> int:
 
         low_level_probe_payload: dict[str, Any] | None = None
         if args.run_low_level_mask_probe:
-            add_new_masks = getattr(model, "add_new_masks", None)
-            if not callable(add_new_masks):
+            low_level_build = build_sam3_tracker(
+                checkpoint_path=checkpoint,
+                device="cuda",
+                multiplex_count=args.multiplex_count,
+                use_fa3=args.use_fa3,
+                use_rope_real=args.use_rope_real,
+                compile_model=args.compile,
+                strict_runtime=not bool(args.allow_unsupported_runtime),
+                run_mode=SAM3_RUN_MODE_OFFICIAL,
+            )
+            low_level_model = low_level_build.predictor
+            if not low_level_build.available or low_level_model is None:
                 low_level_probe_payload = {
-                    "status": "blocked_missing_official_mask_api",
-                    "api_path": "full_predictor_model.add_new_masks",
+                    "status": "blocked_low_level_builder_strict_load_failed",
+                    "api_path": "build_sam3_multiplex_video_model.add_new_masks",
                     "checkpoint": str(checkpoint),
-                    "model_class": f"{type(model).__module__}.{type(model).__name__}",
-                    "error": f"{type(model).__name__} does not expose add_new_masks",
+                    "build": low_level_build.to_dict(),
+                    "error": low_level_build.error,
+                    "private_state_used": False,
+                    "checkpoint_remap_used": False,
+                }
+            elif not callable(getattr(low_level_model, "add_new_masks", None)):
+                low_level_probe_payload = {
+                    "status": "blocked_missing_low_level_add_new_masks",
+                    "api_path": "build_sam3_multiplex_video_model.add_new_masks",
+                    "checkpoint": str(checkpoint),
+                    "build": low_level_build.to_dict(),
+                    "model_class": f"{type(low_level_model).__module__}.{type(low_level_model).__name__}",
+                    "error": f"{type(low_level_model).__name__} does not expose add_new_masks",
+                    "private_state_used": False,
+                    "checkpoint_remap_used": False,
                     "relevant_model_callables": [
                         row
-                        for row in _callable_inventory(model)
+                        for row in _callable_inventory(low_level_model)
                         if "mask" in str(row.get("name", "")).lower()
                         or "add" in str(row.get("name", "")).lower()
                     ],
                 }
             else:
                 try:
-                    low_level_probe_payload = _probe_state(args, exp_dir, model, video, checkpoint)
+                    low_level_probe_payload = _probe_state(args, exp_dir, low_level_model, video, checkpoint)
+                    low_level_probe_payload["build"] = low_level_build.to_dict()
+                    low_level_probe_payload["private_state_used"] = False
+                    low_level_probe_payload["checkpoint_remap_used"] = False
                 except Exception as exc:
                     low_level_probe_payload = {
                         "status": "failed",
-                        "api_path": "full_predictor_model.add_new_masks",
+                        "api_path": "build_sam3_multiplex_video_model.add_new_masks",
                         "checkpoint": str(checkpoint),
+                        "build": low_level_build.to_dict(),
                         "error": f"{type(exc).__name__}: {exc}",
                         "traceback": traceback.format_exc(),
+                        "private_state_used": False,
+                        "checkpoint_remap_used": False,
                     }
             _atomic_json(logs_dir / "sam31_low_level_mask_probe.json", low_level_probe_payload)
 
@@ -1147,6 +1197,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         mask_probe = _mask_probe_summary(low_level_probe_payload)
         mask_probe_ok = bool(mask_probe.get("maintained_expected_object_ids"))
+        low_level_api_available = bool(
+            low_level_probe_payload
+            and low_level_probe_payload.get("api_path") == "build_sam3_multiplex_video_model.add_new_masks"
+            and low_level_probe_payload.get("status")
+            not in {"blocked_low_level_builder_strict_load_failed", "blocked_missing_low_level_add_new_masks"}
+        )
         if args.run_low_level_mask_probe:
             status = (
                 "done"
@@ -1155,6 +1211,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             status = "done" if public_session_ok else "failed_public_session_probe"
+        if args.run_low_level_mask_probe and status != "done":
+            sam3_submission_status = str(status)
+        elif args.run_low_level_mask_probe:
+            sam3_submission_status = "go_low_level_mask_api_probe_passed"
+        else:
+            sam3_submission_status = "blocked_public_mask_session_api"
         summary = {
             "status": status,
             "experiment_dir": str(exp_dir),
@@ -1164,16 +1226,12 @@ def main(argv: list[str] | None = None) -> int:
             "video_id": args.video_id,
             "object_ids": public_probe_payload["object_ids"],
             "sam3_checkpoint_load_target": "full_multiplex_predictor",
-            "sam3_submission_status": "blocked_missing_official_mask_api"
-            if status == "blocked_missing_official_mask_api"
-            else "blocked_public_mask_session_api",
+            "sam3_submission_status": sam3_submission_status,
             "sam3_candidate_mode": "point_prompt_only",
             "sam3_public_mask_request": False,
-            "sam3_low_level_add_new_masks": bool(callable(getattr(model, "add_new_masks", None))),
+            "sam3_low_level_add_new_masks": low_level_api_available,
             "sam3_low_level_standalone_video_api": False,
-            "mask_api_path": "full_predictor_model.add_new_masks"
-            if callable(getattr(model, "add_new_masks", None))
-            else None,
+            "mask_api_path": low_level_probe_payload.get("api_path") if low_level_probe_payload else None,
             "private_state_used": False,
             "previous_mask_recovery": False,
             "diagnostic_patch_applied": bool(patch_status.get("diagnostic_patch_applied")),

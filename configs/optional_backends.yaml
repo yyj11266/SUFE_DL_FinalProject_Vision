@@ -17,8 +17,8 @@ optional_backends:
     enabled: false
     required: false
     install: null
-    adapter: src.vos.optional_cutie
-    notes: Optional VOS backend for propagation or ensemble.
+    adapter: src.vos.cutie_optional
+    notes: Optional official Cutie scripting backend for independent first-frame mask-conditioned VOS candidates.
 
   sutrack:
     enabled: false

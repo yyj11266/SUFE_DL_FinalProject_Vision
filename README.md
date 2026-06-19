@@ -15,23 +15,27 @@ Implemented:
 - Strict SAM 3.1 Object Multiplex adapter: `src/trackers/sam3_tracker_optional.py`
 - Native SAM 3.1 runner: `scripts/run_sam31_vos.py`
 - SAM 3.1 Colab workflow: `notebooks/sufe_sam31_colab.ipynb`
+- Optional Cutie candidate adapter: `src/vos/cutie_optional.py`
+- Cutie candidate runner: `scripts/run_cutie_vos.py`
+- Conservative SAM2/Cutie object fusion runner: `scripts/run_sam2_cutie_fusion.py`
 - Frozen MOSEv2 split generator: `src/eval/mosev2_split.py`
 - Object-level recovery state and memory gate: `src/vos/recovery.py`
 
 The reported SAM2.1 control remains `J&F_new=58.66`. The pseudo-anchor result
-`58.58` is rejected as a replacement baseline. SAM 3.1 is currently blocked as
-a submission mainline because the public high-level session API does not expose
-full first-frame mask conditioning with fixed object IDs. The next leaderboard
-mainline is SAM2.1 baseline fallback plus object/window-level conservative
+`58.58` is rejected as a replacement baseline. SAM 3.1 is no longer the
+submission mainline unless one final low-level mask API probe passes on the
+fixed short videos. The next leaderboard mainline is SAM2.1 baseline fallback
+plus Cutie independent mask-conditioned VOS and object-level conservative
 candidate fusion.
 
 ## SAM 3.1 Diagnostic Probe
 
 Use `notebooks/sufe_sam31_colab.ipynb` only for the final SAM3.1 health check.
 It verifies that the released merged checkpoint loads through the full
-`build_sam3_multiplex_video_predictor` path and that the public high-level
-session can preserve explicit object IDs with point prompts. It does not create
-a formal submission.
+`build_sam3_multiplex_video_predictor` path, that the public high-level session
+can preserve explicit object IDs with point prompts, and that the strict
+low-level `build_sam3_multiplex_video_model/add_new_masks` path can keep full
+first-frame mask object IDs. It does not create a formal submission.
 
 Recommended runtime:
 
@@ -52,18 +56,21 @@ python scripts/debug_sam31_api.py \
   --experiment-id sam31_api_probe \
   --checkpoint /path/to/sam3.1_multiplex.pt \
   --sam3-repo-dir /content/facebookresearch_sam3 \
-  --video-id 2b827e3a \
-  --max-frames 5
+  --video-id 0u8fy7u2 \
+  --max-frames 5 \
+  --run-low-level-mask-probe
 ```
 
 This writes `logs/sam31_api_introspection.json`,
 `logs/sam31_public_session_probe.json`, and `logs/summary.json` without
 creating a submission. The Colab notebook also copies these probe JSON files to
 `MyDrive/sufe_vos_review/runs/EXP_ID/` for Codex review.
-The low-level `add_new_masks` path can be enabled with
-`--run-low-level-mask-probe`, but it is a research probe, not a supported
-submission path. `scripts/run_sam31_vos.py --make-submission` is blocked for
-all SAM3.1 modes.
+The go/no-go check must be repeated for `0u8fy7u2` and `2b827e3a`, both with
+five frames. If either fails to preserve all expected object IDs without empty
+non-initial frames, keep the exact `sam3_submission_status` emitted by
+`logs/summary.json` in the review notes and stop SAM3.1 work.
+`scripts/run_sam31_vos.py --make-submission` remains blocked for all SAM3.1
+modes.
 
 Create the frozen MOSEv2 split:
 
@@ -265,6 +272,64 @@ Outputs:
 - `/content/sufe_runs/EXP/submission.zip`
 - `/content/sufe_runs/EXP/sanity_check.json`
 
+## Cutie Candidate and Conservative Fusion
+
+Cutie is the next independent VOS candidate because its official scripting API
+accepts a first-frame indexed mask and propagates object IDs frame by frame.
+Install the official repository on Colab local disk, not inside Drive:
+
+```bash
+python /content/sufe_vos_leaderboard/scripts/run_cutie_vos.py \
+  --data-root /content/sufe_data/video_dataset \
+  --sample-submission /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip \
+  --output-dir /content/sufe_runs \
+  --experiment-id cutie_smoke_720 \
+  --cutie-repo-dir /content/hkchengrex_cutie \
+  --install-cutie \
+  --max-internal-size 720 \
+  --smoke \
+  --max-frames 20 \
+  --save-overlays sample
+```
+
+If the six-video smoke run preserves mask count, exact first frames, and stable
+object IDs, run the full candidate:
+
+```bash
+python /content/sufe_vos_leaderboard/scripts/run_cutie_vos.py \
+  --data-root /content/sufe_data/video_dataset \
+  --sample-submission /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip \
+  --output-dir /content/sufe_runs \
+  --experiment-id cutie_full_720 \
+  --cutie-repo-dir /content/hkchengrex_cutie \
+  --max-internal-size 720 \
+  --save-overlays sample \
+  --make-submission
+```
+
+Fuse a completed SAM2 baseline with the completed Cutie candidate:
+
+```bash
+python /content/sufe_vos_leaderboard/scripts/run_sam2_cutie_fusion.py \
+  --data-root /content/sufe_data/video_dataset \
+  --sample-submission /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip \
+  --baseline-exp /content/sufe_runs/SAM2_BASELINE_EXP \
+  --cutie-exp /content/sufe_runs/cutie_full_720 \
+  --output-dir /content/sufe_runs \
+  --experiment-id sam2_cutie_fusion_720 \
+  --min-cutie-area 16 \
+  --min-sam2-iou 0.50 \
+  --min-temporal-iou 0.35 \
+  --min-area-ratio 0.20 \
+  --max-area-ratio 3.50 \
+  --make-submission
+```
+
+Fusion rules are global and conservative: the SAM2 current-frame mask is the
+anchor, Cutie replaces only an object that passes IoU, temporal IoU, area-ratio,
+and ID-completeness gates. The fusion runner never uses previous-mask recovery
+as a prediction fallback.
+
 ## SAM2.1 Pseudo-Anchor Optimization
 
 After a full baseline exists, run the optimization notebook:
@@ -345,7 +410,7 @@ runtime, or native mask API is unavailable. The following supplementary
 backends remain optional and are not active in the native baseline:
 
 - SAM 3 visual/text detector for later object-level recovery
-- Cutie
+- Cutie official scripting backend for an independent mask-conditioned VOS candidate
 - SUTrack
 - GroundingDINO
 - T-Rex2
