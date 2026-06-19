@@ -731,6 +731,16 @@ def main(argv: list[str] | None = None) -> int:
                     "frame_index": row["frame_index"],
                     "raw_output_object_ids": row["raw_output_object_ids"],
                     "missing_expected_object_ids": row["missing_expected_object_ids"],
+                    "internal_tracker_recovery": (
+                        {
+                            "available": bool(row["internal_tracker_recovery"].get("available")),
+                            "recovered_object_ids": row["internal_tracker_recovery"].get("recovered_object_ids"),
+                            "per_object_positive_pixels": row["internal_tracker_recovery"].get("per_object_positive_pixels"),
+                            "object_score_logits": row["internal_tracker_recovery"].get("object_score_logits"),
+                        }
+                        if isinstance(row.get("internal_tracker_recovery"), Mapping)
+                        else None
+                    ),
                 }
                 for row in probe_payload["propagation"]
             ],
