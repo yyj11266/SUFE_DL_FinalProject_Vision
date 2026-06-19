@@ -187,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
         status["summary"] = {"status": "failed", "errors": errors, "warnings": warnings}
         _atomic_json(logs_dir / "per_video_status.json", status)
         _write_failure_sanity(exp_dir, errors, warnings)
+        print(json.dumps(status["summary"], indent=2, ensure_ascii=True))
         return 1
 
     cutie_status = install_or_check_cutie(args.cutie_repo_dir, install=bool(args.install_cutie))
@@ -195,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         status["summary"] = {"status": "failed", "errors": errors, "warnings": warnings, "cutie": cutie_status.to_dict()}
         _atomic_json(logs_dir / "per_video_status.json", status)
         _write_failure_sanity(exp_dir, errors, warnings)
+        print(json.dumps(status["summary"], indent=2, ensure_ascii=True))
         return 1
 
     model: Any | None = None
@@ -240,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         status["summary"] = {"status": "failed", "errors": errors, "warnings": warnings, "cutie": cutie_status.to_dict()}
         _atomic_json(logs_dir / "per_video_status.json", status)
         _write_failure_sanity(exp_dir, errors, warnings)
+        print(json.dumps(status["summary"], indent=2, ensure_ascii=True))
         return 1
 
     if args.make_submission:
@@ -251,12 +254,14 @@ def main(argv: list[str] | None = None) -> int:
             if not sanity["passed"]:
                 status["summary"] = {"status": "failed_validation", "errors": sanity["errors"], "warnings": sanity["warnings"]}
                 _atomic_json(logs_dir / "per_video_status.json", status)
+                print(json.dumps(status["summary"], indent=2, ensure_ascii=True))
                 return 1
         except Exception as exc:
             errors.append(f"Submission creation/validation failed: {type(exc).__name__}: {exc}")
             status["summary"] = {"status": "failed", "errors": errors, "warnings": warnings}
             _atomic_json(logs_dir / "per_video_status.json", status)
             _write_failure_sanity(exp_dir, errors, warnings)
+            print(json.dumps(status["summary"], indent=2, ensure_ascii=True))
             return 1
     else:
         _atomic_json(
