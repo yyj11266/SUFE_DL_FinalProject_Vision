@@ -681,6 +681,8 @@ def _patch_model_init_state_filter_kwargs(predictor: Any) -> dict[str, Any]:
         filtered = {key: value for key, value in kwargs.items() if key in accepted}
         return original(*args, **filtered)
 
+    init_state_filter_kwargs.__signature__ = signature  # type: ignore[attr-defined]
+    init_state_filter_kwargs.__wrapped__ = original  # type: ignore[attr-defined]
     try:
         setattr(model, "init_state", init_state_filter_kwargs)
         setattr(model, "_sufe_filter_init_state_kwargs_patch", True)

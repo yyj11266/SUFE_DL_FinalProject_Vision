@@ -1,6 +1,45 @@
 from __future__ import annotations
 
-from scripts.debug_sam31_api import _mask_probe_summary
+import inspect
+
+from scripts.debug_sam31_api import _mask_probe_summary, _patch_model_init_state_filter_kwargs
+
+
+class _FakeModel:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def init_state(self, resource_path: str, async_loading_frames: bool = False) -> dict[str, object]:
+        self.calls.append(
+            {
+                "resource_path": resource_path,
+                "async_loading_frames": async_loading_frames,
+            }
+        )
+        return {"resource_path": resource_path}
+
+
+class _FakePredictor:
+    def __init__(self) -> None:
+        self.model = _FakeModel()
+
+
+def test_init_state_patch_preserves_signature_and_filters_kwargs() -> None:
+    predictor = _FakePredictor()
+
+    status = _patch_model_init_state_filter_kwargs(predictor)
+    signature = inspect.signature(predictor.model.init_state)
+    state = predictor.model.init_state(
+        resource_path="/tmp/video",
+        async_loading_frames=True,
+        offload_state_to_cpu=True,
+    )
+
+    assert status["diagnostic_patch_applied"] is True
+    assert "resource_path" in signature.parameters
+    assert "offload_state_to_cpu" not in signature.parameters
+    assert state == {"resource_path": "/tmp/video"}
+    assert predictor.model.calls == [{"resource_path": "/tmp/video", "async_loading_frames": True}]
 
 
 def test_mask_probe_summary_accepts_complete_object_ids() -> None:
