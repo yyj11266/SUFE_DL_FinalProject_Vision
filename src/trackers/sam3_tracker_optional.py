@@ -1,10 +1,11 @@
-"""Strict SAM 3.1 Object Multiplex adapter for semi-supervised VOS.
+"""Diagnostic SAM 3.1 Object Multiplex adapter for semi-supervised VOS.
 
-The submission path uses the official full Object Multiplex video predictor.
-The older low-level tracker path is kept only as an explicit debug mode because
-it can produce valid files while silently losing objects after the first frames.
-Mask prompts are never converted to boxes or points, and setup failures never
-fall back to SAM2. This keeps the SAM 3.1 experiment interpretable.
+SAM3.1 is currently blocked as a submission mainline because the released
+high-level session API does not expose full-mask video conditioning. The
+low-level add_new_masks path is kept only as a research probe because it can
+produce valid files while silently losing objects after the first frames. Mask
+prompt failures never fall back to points or SAM2 inside this adapter, which
+keeps SAM3.1 diagnostics interpretable.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from src.trackers.sam2_tracker import (
 
 
 SAM3_REPO_URL = "https://github.com/facebookresearch/sam3.git"
-SAM31_HF_REPO = "research21/sam3.1"
+SAM31_HF_REPO = "facebook/sam3.1"
 SAM31_CHECKPOINT_NAME = "sam3.1_multiplex.pt"
 SAM3_RUN_MODE_OFFICIAL = "official_mask_api"
 SAM3_RUN_MODE_FULL = "full_predictor_mask"
@@ -260,7 +261,7 @@ def check_sam3_available(
             errors.append(f"SAM 3.1 checkpoint is missing or empty: {checkpoint}")
     hf_token_present = _hf_token_present()
     if not checkpoint_path and not hf_token_present:
-        warnings.append(f"No local checkpoint and no Hugging Face token; public repo {SAM31_HF_REPO} may still download.")
+        warnings.append(f"No local checkpoint and no Hugging Face token; gated repo {SAM31_HF_REPO} requires access.")
 
     if not strict_runtime:
         runtime_errors = [

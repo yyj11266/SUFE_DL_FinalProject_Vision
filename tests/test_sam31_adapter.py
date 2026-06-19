@@ -566,10 +566,10 @@ class Sam31AdapterTest(unittest.TestCase):
         fake_builder_mod.build_sam3_multiplex_video_model.assert_called_once()
         self.assertEqual(result.build_config["builder"], "build_sam3_multiplex_video_model/add_new_masks")
 
-    def test_legacy_modes_cannot_make_submission(self) -> None:
+    def test_sam31_modes_cannot_make_submission(self) -> None:
         from scripts.run_sam31_vos import main
 
-        for run_mode in ("low_level_debug", "full_predictor_mask"):
+        for run_mode in ("official_mask_api", "low_level_debug", "full_predictor_mask"):
             with self.subTest(run_mode=run_mode), self.assertRaises(SystemExit) as raised:
                 main(
                     [
@@ -582,7 +582,7 @@ class Sam31AdapterTest(unittest.TestCase):
                         "--make-submission",
                     ]
                 )
-            self.assertIn("official_mask_api", str(raised.exception))
+            self.assertIn("SAM3.1 --make-submission is blocked", str(raised.exception))
 
     def test_official_cli_rejects_previous_policy(self) -> None:
         from scripts.run_sam31_vos import main

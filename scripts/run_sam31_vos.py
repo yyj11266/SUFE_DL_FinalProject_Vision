@@ -62,7 +62,7 @@ def _parser() -> argparse.ArgumentParser:
         "--sam3-run-mode",
         default=SAM3_RUN_MODE_OFFICIAL,
         choices=SAM3_RUN_MODES,
-        help="SAM 3.1 backend mode. Only official_mask_api is allowed for submissions.",
+        help="SAM 3.1 diagnostic backend mode. SAM3.1 submissions are currently blocked.",
     )
     parser.add_argument("--original-resolution", action="store_true", help="Explicitly document original-resolution inference.")
     parser.add_argument("--video-ids", help="Comma-separated video IDs for smoke or split runs.")
@@ -531,8 +531,11 @@ def _sam3_repo_commit(repo_dir_text: str | None) -> str | None:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.make_submission and args.sam3_run_mode != SAM3_RUN_MODE_OFFICIAL:
-        raise SystemExit("--make-submission is only allowed with --sam3-run-mode official_mask_api")
+    if args.make_submission:
+        raise SystemExit(
+            "SAM3.1 --make-submission is blocked: the public high-level session API does not expose "
+            "full first-frame mask conditioning with fixed object IDs. Use SAM3.1 only for diagnostics/candidates."
+        )
     if args.make_submission and not args.sample_submission:
         raise SystemExit("--make-submission requires --sample-submission for strict format validation")
     if args.make_submission and args.sample_submission and not Path(args.sample_submission).expanduser().exists():
@@ -635,6 +638,11 @@ def main(argv: list[str] | None = None) -> int:
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "backend": "sam3.1_object_multiplex",
         "sam3_run_mode": args.sam3_run_mode,
+        "sam3_submission_status": "blocked_public_mask_session_api",
+        "sam3_candidate_mode": "diagnostic_only",
+        "sam3_public_mask_request": False,
+        "sam3_low_level_add_new_masks": args.sam3_run_mode in {SAM3_RUN_MODE_OFFICIAL, SAM3_RUN_MODE_LOW_LEVEL},
+        "sam3_low_level_standalone_video_api": False,
         "mask_conditioning_path": mask_conditioning_path,
         "sam3_official_api_path": sam3_official_api_path,
         "private_state_used": private_state_used,

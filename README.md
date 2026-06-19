@@ -19,15 +19,19 @@ Implemented:
 - Object-level recovery state and memory gate: `src/vos/recovery.py`
 
 The reported SAM2.1 control remains `J&F_new=58.66`. The pseudo-anchor result
-`58.58` is rejected as a replacement baseline. The current mainline is a pure
-SAM 3.1 baseline; recovery remains disabled until it improves an external
-holdout by at least 0.4 points.
+`58.58` is rejected as a replacement baseline. SAM 3.1 is currently blocked as
+a submission mainline because the public high-level session API does not expose
+full first-frame mask conditioning with fixed object IDs. The next leaderboard
+mainline is SAM2.1 baseline fallback plus object/window-level conservative
+candidate fusion.
 
-## SAM 3.1 Mainline
+## SAM 3.1 Diagnostic Probe
 
-Use `notebooks/sufe_sam31_colab.ipynb`. It performs runtime/auth checks, a
-single-object and multi-object 5-frame smoke test, optional MOSEv2 calibration
-and holdout runs, full SUFE inference, and final submission validation.
+Use `notebooks/sufe_sam31_colab.ipynb` only for the final SAM3.1 health check.
+It verifies that the released merged checkpoint loads through the full
+`build_sam3_multiplex_video_predictor` path and that the public high-level
+session can preserve explicit object IDs with point prompts. It does not create
+a formal submission.
 
 Recommended runtime:
 
@@ -36,32 +40,8 @@ Recommended runtime:
 - T4 is unsupported for the full run
 
 Required runtime: Python 3.12+, PyTorch 2.7+, CUDA 12.6+, and a BF16 GPU.
-The notebook defaults to `research21/sam3.1`; `HF_TOKEN` is only needed if you
-switch `SAM31_HF_REPO_ID` or `--hf-repo-id` back to a gated repository.
-
-```bash
-python scripts/run_sam31_vos.py \
-  --data-root /content/sufe_data/video_dataset \
-  --sample-submission /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip \
-  --output-dir /content/sufe_runs \
-  --experiment-id sam31_official_mask_api_full \
-  --hf-repo-id research21/sam3.1 \
-  --sam3-repo-dir /content/sam3 \
-  --prompt-mode mask \
-  --original-resolution \
-  --save-native-scores \
-  --save-overlays sample \
-  --make-submission
-```
-
-The runner requires the official `build_sam3_multiplex_video_model`,
-`add_new_masks`, and `propagate_in_video` interfaces. It jointly initializes
-all first-frame objects from their complete masks, copies frame zero exactly,
-keeps object IDs fixed, saves native presence/IoU fields when exposed, and
-never falls back to points or SAM2.
-
-Before a full SAM 3.1 run, probe the official `add_new_masks` state flow on one
-short real video:
+The notebook defaults to the gated `facebook/sam3.1` checkpoint repository; set
+`HF_TOKEN` or override `SAM31_HF_REPO_ID` only for a deliberate mirror test.
 
 ```bash
 python scripts/debug_sam31_api.py \
@@ -74,13 +54,14 @@ python scripts/debug_sam31_api.py \
   --max-frames 5
 ```
 
-This writes `logs/sam31_api_introspection.json` and
-`logs/sam31_state_probe.json` without creating a submission.
-The Colab notebook also copies these probe JSON files to
+This writes `logs/sam31_api_introspection.json`,
+`logs/sam31_public_session_probe.json`, and `logs/summary.json` without
+creating a submission. The Colab notebook also copies these probe JSON files to
 `MyDrive/sufe_vos_review/runs/EXP_ID/` for Codex review.
-The submission path uses `official_mask_api` and rejects previous-mask
-diagnostic policies. Legacy `full_predictor_mask` runs may still be used for
-state debugging, but they are blocked from `--make-submission`.
+The low-level `add_new_masks` path can be enabled with
+`--run-low-level-mask-probe`, but it is a research probe, not a supported
+submission path. `scripts/run_sam31_vos.py --make-submission` is blocked for
+all SAM3.1 modes.
 
 Create the frozen MOSEv2 split:
 

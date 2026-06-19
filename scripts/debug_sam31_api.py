@@ -1,10 +1,13 @@
-"""Probe SAM 3.1 official mask API state.
+"""Probe SAM 3.1 high-level video predictor state.
 
-This script is intentionally diagnostic-only. It builds the official SAM 3.1
-mask/VOS model, conditions one short real SUFE video with the complete
-first-frame mask through add_new_masks, and writes compact JSON snapshots of
-the API, state keys, and first propagation outputs.
-It does not create masks or a submission.
+This script is intentionally diagnostic-only. It builds the full SAM 3.1
+multiplex video predictor expected by the released merged checkpoint, audits
+checkpoint coverage against the final model, and checks the public high-level
+session API with explicit object IDs from first-frame point prompts.
+
+The low-level add_new_masks path can be enabled as a research probe, but it is
+not treated as a supported submission API. This script never creates masks or a
+submission.
 """
 
 from __future__ import annotations
@@ -72,7 +75,7 @@ API_KEYWORDS = (
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Debug SAM 3.1 official add_new_masks state.")
+    parser = argparse.ArgumentParser(description="Debug SAM 3.1 full predictor and public session state.")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--experiment-id", default=f"sam31_api_probe_{dt.datetime.now():%Y%m%d_%H%M%S}")
@@ -90,6 +93,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--offload-video-to-cpu", action="store_true")
     parser.add_argument("--offload-state-to-cpu", action="store_true")
     parser.add_argument("--allow-unsupported-runtime", action="store_true")
+    parser.add_argument(
+        "--run-low-level-mask-probe",
+        action="store_true",
+        help="Also try the low-level add_new_masks state probe after the full predictor probe.",
+    )
     return parser
 
 
@@ -513,18 +521,139 @@ def _checkpoint_key_summary(checkpoint: Path | None, model: Any | None = None) -
     return summary
 
 
+def _load_checkpoint_state(checkpoint: Path) -> Mapping[str, Any]:
+    import torch
+
+    try:
+        payload = torch.load(str(checkpoint), map_location="cpu", weights_only=True, mmap=True)
+    except (TypeError, RuntimeError):
+        payload = torch.load(str(checkpoint), map_location="cpu", weights_only=True)
+    if isinstance(payload, Mapping) and isinstance(payload.get("model"), Mapping):
+        payload = payload["model"]
+    if not isinstance(payload, Mapping):
+        raise RuntimeError(f"Checkpoint payload is not a state dict: {type(payload).__name__}")
+    return payload
+
+
+def _remap_full_checkpoint_state(state: Mapping[str, Any]) -> dict[str, Any]:
+    if not any(str(key).startswith(("sam3_model.", "sam2_predictor.")) for key in state):
+        return {str(key): value for key, value in state.items()}
+    remapped: dict[str, Any] = {}
+    for raw_key, value in state.items():
+        key = str(raw_key)
+        if key.startswith("sam3_model."):
+            key = "detector." + key[len("sam3_model.") :]
+        elif key.startswith("sam2_predictor."):
+            key = "tracker." + key[len("sam2_predictor.") :]
+        remapped[key] = value
+    return remapped
+
+
+def _checkpoint_full_model_audit(checkpoint: Path | None, predictor: Any) -> dict[str, Any]:
+    """Audit the released merged checkpoint against the final full predictor model."""
+
+    if checkpoint is None:
+        return {
+            "status": "skipped",
+            "passed": False,
+            "reason": "no local checkpoint path",
+            "blocking_reasons": ["no_local_checkpoint"],
+        }
+    model = getattr(predictor, "model", predictor)
+    try:
+        state = _remap_full_checkpoint_state(_load_checkpoint_state(Path(checkpoint)))
+        model_state = model.state_dict()
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "passed": False,
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+            "blocking_reasons": ["checkpoint_audit_failed"],
+        }
+
+    checkpoint_keys = set(state)
+    model_keys = set(str(key) for key in model_state)
+    parameter_keys = set(str(key) for key in dict(model.named_parameters()))
+    buffer_keys = set(str(key) for key in dict(model.named_buffers()))
+    missing = sorted(model_keys - checkpoint_keys)
+    unexpected = sorted(checkpoint_keys - model_keys)
+    shape_bad = sorted(
+        key
+        for key in checkpoint_keys & model_keys
+        if _shape_tuple(state[key]) != _shape_tuple(model_state[key])
+    )
+    missing_parameters = sorted(set(missing) & parameter_keys)
+    missing_buffers = sorted(set(missing) & buffer_keys)
+    blocking_reasons: list[str] = []
+    if shape_bad:
+        blocking_reasons.append("shape_mismatch")
+    if missing_parameters:
+        blocking_reasons.append("missing_learned_parameters")
+    if unexpected:
+        blocking_reasons.append("unexpected_checkpoint_tensors")
+    return {
+        "status": "done",
+        "passed": not blocking_reasons,
+        "blocking_reasons": blocking_reasons,
+        "checkpoint_key_count": len(checkpoint_keys),
+        "model_key_count": len(model_keys),
+        "missing_total": len(missing),
+        "missing_learned_parameters": len(missing_parameters),
+        "missing_buffers": len(missing_buffers),
+        "unexpected_total": len(unexpected),
+        "shape_mismatch_total": len(shape_bad),
+        "missing_examples": missing[:40],
+        "missing_learned_parameter_examples": missing_parameters[:40],
+        "missing_buffer_examples": missing_buffers[:40],
+        "unexpected_examples": unexpected[:40],
+        "shape_mismatch_examples": shape_bad[:40],
+    }
+
+
+def _build_full_predictor(args: argparse.Namespace, checkpoint: Path | None) -> tuple[Any, dict[str, Any]]:
+    import importlib
+
+    builder_mod = importlib.import_module("sam3.model_builder")
+    common = {
+        "checkpoint_path": str(checkpoint) if checkpoint else None,
+        "max_num_objects": max(16, int(args.multiplex_count)),
+        "multiplex_count": max(1, int(args.multiplex_count)),
+        "use_fa3": bool(args.use_fa3),
+        "use_rope_real": bool(args.use_rope_real),
+        "compile": bool(args.compile),
+        "warm_up": False,
+        "default_output_prob_thresh": 0.5,
+        "async_loading_frames": False,
+    }
+    if hasattr(builder_mod, "build_sam3_multiplex_video_predictor"):
+        builder = getattr(builder_mod, "build_sam3_multiplex_video_predictor")
+        return _call_supported(builder, **common), {**common, "builder": "build_sam3_multiplex_video_predictor"}
+    if hasattr(builder_mod, "build_sam3_predictor"):
+        builder = getattr(builder_mod, "build_sam3_predictor")
+        return _call_supported(builder, version="sam3.1", **common), {
+            **common,
+            "builder": "build_sam3_predictor",
+            "version": "sam3.1",
+        }
+    raise RuntimeError("SAM3 model_builder exposes neither build_sam3_multiplex_video_predictor nor build_sam3_predictor")
+
+
 def _mask_center_and_box(mask: np.ndarray) -> tuple[list[float], list[float]]:
     ys, xs = np.nonzero(mask)
     if len(xs) == 0 or len(ys) == 0:
         raise RuntimeError("Cannot create a public-session point prompt from an empty object mask")
     x0, x1 = float(xs.min()), float(xs.max() + 1)
     y0, y1 = float(ys.min()), float(ys.max() + 1)
-    return [(x0 + x1) / 2.0, (y0 + y1) / 2.0], [x0, y0, x1 - x0, y1 - y0]
+    center_x = float(xs.mean())
+    center_y = float(ys.mean())
+    best = int(np.argmin((xs.astype(np.float32) - center_x) ** 2 + (ys.astype(np.float32) - center_y) ** 2))
+    return [float(xs[best]), float(ys[best])], [x0, y0, x1 - x0, y1 - y0]
 
 
 def _probe_public_session(
     args: argparse.Namespace,
-    checkpoint: Path | None,
+    predictor: Any,
     frame_dir: Path,
     annotation: np.ndarray,
     object_ids: list[int],
@@ -532,49 +661,52 @@ def _probe_public_session(
 ) -> dict[str, Any]:
     """Best-effort check of the official interactive session API.
 
-    This is intentionally diagnostic-only. The submission path remains the
-    complete-mask add_new_masks API.
+    This is intentionally diagnostic-only. It checks that explicit object IDs
+    can survive a point-prompt session, not that SAM3.1 can consume full masks.
     """
 
     try:
-        import importlib
         import torch
 
-        builder_mod = importlib.import_module("sam3.model_builder")
-        builder = getattr(builder_mod, "build_sam3_multiplex_video_predictor")
-        predictor = builder(
-            checkpoint_path=str(checkpoint) if checkpoint else None,
-            max_num_objects=max(16, int(args.multiplex_count)),
-            multiplex_count=max(1, int(args.multiplex_count)),
-            use_fa3=bool(args.use_fa3),
-            use_rope_real=bool(args.use_rope_real),
-            compile=bool(args.compile),
-            warm_up=False,
-            default_output_prob_thresh=0.5,
-            async_loading_frames=False,
-        )
         start = predictor.handle_request(
             request={"type": "start_session", "resource_path": str(frame_dir)}
         )
         session_id = start["session_id"]
-        object_id = int(object_ids[0])
-        point_abs, box_abs = _mask_center_and_box(annotation == object_id)
         height, width = annotation.shape[:2]
-        point_rel = [[point_abs[0] / width, point_abs[1] / height]]
-        box_rel = [[box_abs[0] / width, box_abs[1] / height, box_abs[2] / width, box_abs[3] / height]]
-        add = predictor.handle_request(
-            request={
-                "type": "add_prompt",
-                "session_id": session_id,
-                "frame_index": 0,
-                "points": torch.tensor(point_rel, dtype=torch.float32),
-                "point_labels": torch.tensor([1], dtype=torch.int32),
-                "obj_id": object_id,
-            }
-        )
+        add_prompt_rows: list[dict[str, Any]] = []
+        for object_id in object_ids:
+            point_abs, box_abs = _mask_center_and_box(annotation == int(object_id))
+            point_rel = [[point_abs[0] / width, point_abs[1] / height]]
+            box_rel = [[box_abs[0] / width, box_abs[1] / height, box_abs[2] / width, box_abs[3] / height]]
+            add = predictor.handle_request(
+                request={
+                    "type": "add_prompt",
+                    "session_id": session_id,
+                    "frame_index": 0,
+                    "points": torch.tensor(point_rel, dtype=torch.float32),
+                    "point_labels": torch.tensor([1], dtype=torch.int32),
+                    "obj_id": int(object_id),
+                }
+            )
+            add_prompt_rows.append(
+                {
+                    "object_id": int(object_id),
+                    "point_abs": point_abs,
+                    "point_rel": point_rel[0],
+                    "box_abs_reference": box_abs,
+                    "box_rel_reference": box_rel[0],
+                    "add_prompt_output_keys": sorted(add.get("outputs", {}).keys())
+                    if isinstance(add.get("outputs"), Mapping)
+                    else [],
+                }
+            )
         stream_rows: list[dict[str, Any]] = []
         for response in predictor.handle_stream_request(
-            request={"type": "propagate_in_video", "session_id": session_id}
+            request={
+                "type": "propagate_in_video",
+                "session_id": session_id,
+                "propagation_direction": "forward",
+            }
         ):
             row = {
                 "frame_index": int(response.get("frame_index", response.get("frame_idx", len(stream_rows)))),
@@ -598,15 +730,21 @@ def _probe_public_session(
             predictor.handle_request(request={"type": "reset_session", "session_id": session_id})
         except Exception:
             pass
+        expected = set(int(object_id) for object_id in object_ids)
+        rows_with_ids = [
+            set(int(value) for value in row.get("output_object_ids", []))
+            for row in stream_rows
+            if "output_object_ids" in row
+        ]
         return {
             "status": "done",
-            "prompt": "single_positive_point_from_first_object_center",
-            "object_id": object_id,
-            "point_abs": point_abs,
-            "point_rel": point_rel[0],
-            "box_abs_reference": box_abs,
-            "box_rel_reference": box_rel[0],
-            "add_prompt_output_keys": sorted(add.get("outputs", {}).keys()) if isinstance(add.get("outputs"), Mapping) else [],
+            "prompt": "per_object_positive_point_from_first_frame_mask",
+            "candidate_mode": "point_prompt_only",
+            "mask_prompt_used": False,
+            "expected_object_ids": sorted(expected),
+            "added_prompts": add_prompt_rows,
+            "maintained_expected_object_ids": bool(rows_with_ids)
+            and all(expected.issubset(ids) for ids in rows_with_ids),
             "propagation": stream_rows,
         }
     except Exception as exc:
@@ -617,9 +755,7 @@ def _probe_public_session(
         }
 
 
-def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any, checkpoint: Path | None) -> dict[str, Any]:
-    import torch
-
+def _prepare_probe_inputs(args: argparse.Namespace, exp_dir: Path, video: Any) -> dict[str, Any]:
     data_root = Path(args.data_root).expanduser().resolve()
     cache_dir = exp_dir / "cache"
     prepared_frames = _prepare_frame_dir(
@@ -640,8 +776,28 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
     object_ids = sorted(int(object_id) for object_id in object_masks)
     if not object_ids:
         raise RuntimeError(f"{video.video_id}: first-frame annotation contains no object IDs")
-
     frame_dir = _session_frame_dir(prepared_frames, target_frame_count, cache_dir, video.video_id)
+    return {
+        "data_root": data_root,
+        "cache_dir": cache_dir,
+        "prepared_frames": prepared_frames,
+        "target_frame_count": target_frame_count,
+        "annotation": annotation,
+        "object_masks": object_masks,
+        "object_ids": object_ids,
+        "frame_dir": frame_dir,
+    }
+
+
+def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any, checkpoint: Path | None) -> dict[str, Any]:
+    import torch
+
+    inputs = _prepare_probe_inputs(args, exp_dir, video)
+    target_frame_count = int(inputs["target_frame_count"])
+    annotation = inputs["annotation"]
+    object_masks = inputs["object_masks"]
+    object_ids = inputs["object_ids"]
+    frame_dir = inputs["frame_dir"]
     state = _initialize_native_state(
         model,
         frame_dir,
@@ -744,14 +900,7 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
         "conditioning_info": conditioning_info,
         "propagation": propagation_rows,
         "snapshots": snapshots,
-        "public_session_probe": _probe_public_session(
-            args,
-            checkpoint,
-            frame_dir,
-            annotation,
-            object_ids,
-            target_frame_count,
-        ),
+        "checkpoint": str(checkpoint) if checkpoint else None,
     }
 
 
@@ -775,66 +924,137 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         checkpoint = _resolve_checkpoint(args, exp_dir)
-        build = build_sam3_tracker(
-            checkpoint_path=checkpoint,
-            device="cuda",
-            multiplex_count=args.multiplex_count,
-            use_fa3=args.use_fa3,
-            use_rope_real=args.use_rope_real,
-            compile_model=args.compile,
-            strict_runtime=not args.allow_unsupported_runtime,
-            run_mode=SAM3_RUN_MODE_OFFICIAL,
-        )
-        if not build.available or build.predictor is None:
-            payload = {"status": "failed_build", "checkpoint": str(checkpoint), "build": build.to_dict()}
+        try:
+            predictor, build_config = _build_full_predictor(args, checkpoint)
+        except Exception as exc:
+            payload = {
+                "status": "failed_full_predictor_build",
+                "checkpoint": str(checkpoint),
+                "sam3_checkpoint_load_target": "full_multiplex_predictor",
+                "error": f"{type(exc).__name__}: {exc}",
+                "traceback": traceback.format_exc(),
+            }
             _atomic_json(logs_dir / "sam31_api_introspection.json", payload)
             print(json.dumps(payload, indent=2, ensure_ascii=True))
             return 1
 
-        model = build.predictor
+        model = getattr(predictor, "model", predictor)
+        audit = _checkpoint_full_model_audit(checkpoint, predictor)
         api_payload = {
             "status": "built",
             "experiment_id": args.experiment_id,
             "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             "checkpoint": str(checkpoint),
-            "checkpoint_keys": _checkpoint_key_summary(checkpoint, model),
-            "model_state_keys": _model_state_key_summary(model),
-            "build": build.to_dict(),
+            "sam3_checkpoint_load_target": "full_multiplex_predictor",
+            "sam3_submission_status": "blocked_public_mask_session_api",
+            "sam3_public_mask_request": False,
+            "sam3_low_level_add_new_masks": True,
+            "sam3_low_level_standalone_video_api": False,
+            "sam3_candidate_mode": "point_prompt_only",
             "private_state_used": False,
-            "sam3_official_api_path": "add_new_masks",
+            "previous_mask_recovery": False,
+            "checkpoint_keys": _checkpoint_key_summary(checkpoint, model),
+            "checkpoint_full_model_audit": audit,
+            "model_state_keys": _model_state_key_summary(model),
+            "build": {
+                "available": True,
+                "build_config": build_config,
+            },
+            "predictor_class": f"{type(predictor).__module__}.{type(predictor).__name__}",
             "model_class": f"{type(model).__module__}.{type(model).__name__}",
             "runtime": _runtime_version(model),
+            "predictor_callables": _callable_inventory(predictor),
             "model_callables": _callable_inventory(model),
         }
         _atomic_json(logs_dir / "sam31_api_introspection.json", api_payload)
+        if not bool(audit.get("passed")):
+            payload = {
+                "status": "failed_checkpoint_audit",
+                "checkpoint": str(checkpoint),
+                "api_introspection": str(logs_dir / "sam31_api_introspection.json"),
+                "blocking_reasons": audit.get("blocking_reasons", []),
+                "sam3_submission_status": "blocked_public_mask_session_api",
+            }
+            _atomic_json(logs_dir / "summary.json", payload)
+            print(json.dumps(payload, indent=2, ensure_ascii=True))
+            return 1
 
         video = _select_video(Path(args.data_root).expanduser().resolve(), args.video_id)
-        probe_payload = _probe_state(args, exp_dir, model, video, checkpoint)
-        _atomic_json(logs_dir / "sam31_state_probe.json", probe_payload)
+        inputs = _prepare_probe_inputs(args, exp_dir, video)
+        public_probe_payload = {
+            "video_id": video.video_id,
+            "target_frame_count": int(inputs["target_frame_count"]),
+            "frame_dir": str(inputs["frame_dir"]),
+            "object_ids": inputs["object_ids"],
+            "initial_mask_shape": list(inputs["annotation"].shape),
+            "initial_object_pixel_counts": {
+                str(object_id): int(inputs["object_masks"][object_id].sum())
+                for object_id in inputs["object_ids"]
+            },
+            "checkpoint": str(checkpoint) if checkpoint else None,
+            "public_session_probe": _probe_public_session(
+                args,
+                predictor,
+                inputs["frame_dir"],
+                inputs["annotation"],
+                inputs["object_ids"],
+                int(inputs["target_frame_count"]),
+            ),
+        }
+        _atomic_json(logs_dir / "sam31_public_session_probe.json", public_probe_payload)
 
+        low_level_probe_payload: dict[str, Any] | None = None
+        if args.run_low_level_mask_probe:
+            low_level_build = build_sam3_tracker(
+                checkpoint_path=checkpoint,
+                device="cuda",
+                multiplex_count=args.multiplex_count,
+                use_fa3=args.use_fa3,
+                use_rope_real=args.use_rope_real,
+                compile_model=args.compile,
+                strict_runtime=not args.allow_unsupported_runtime,
+                run_mode=SAM3_RUN_MODE_OFFICIAL,
+            )
+            if not low_level_build.available or low_level_build.predictor is None:
+                low_level_probe_payload = {
+                    "status": "failed_low_level_build",
+                    "checkpoint": str(checkpoint),
+                    "build": low_level_build.to_dict(),
+                }
+            else:
+                low_level_probe_payload = _probe_state(args, exp_dir, low_level_build.predictor, video, checkpoint)
+            _atomic_json(logs_dir / "sam31_low_level_mask_probe.json", low_level_probe_payload)
+
+        public_session = public_probe_payload.get("public_session_probe", {})
+        public_session_ok = (
+            public_session.get("status") == "done"
+            and bool(public_session.get("maintained_expected_object_ids"))
+        )
         summary = {
-            "status": "done",
+            "status": "done" if public_session_ok else "failed_public_session_probe",
             "experiment_dir": str(exp_dir),
             "api_introspection": str(logs_dir / "sam31_api_introspection.json"),
-            "state_probe": str(logs_dir / "sam31_state_probe.json"),
+            "public_session_probe": str(logs_dir / "sam31_public_session_probe.json"),
+            "low_level_mask_probe": str(logs_dir / "sam31_low_level_mask_probe.json") if low_level_probe_payload is not None else None,
             "video_id": args.video_id,
-            "object_ids": probe_payload["object_ids"],
-            "mask_api_path": "add_new_masks",
+            "object_ids": public_probe_payload["object_ids"],
+            "sam3_checkpoint_load_target": "full_multiplex_predictor",
+            "sam3_submission_status": "blocked_public_mask_session_api",
+            "sam3_candidate_mode": "point_prompt_only",
+            "sam3_public_mask_request": False,
+            "sam3_low_level_add_new_masks": True,
+            "sam3_low_level_standalone_video_api": False,
+            "mask_api_path": None,
             "private_state_used": False,
-            "public_session_probe_status": probe_payload.get("public_session_probe", {}).get("status"),
-            "propagation": [
-                {
-                    "frame_index": row["frame_index"],
-                    "raw_output_object_ids": row["raw_output_object_ids"],
-                    "missing_expected_object_ids": row["missing_expected_object_ids"],
-                    "internal_tracker_recovery": None,
-                }
-                for row in probe_payload["propagation"]
-            ],
+            "previous_mask_recovery": False,
+            "checkpoint_audit_passed": bool(audit.get("passed")),
+            "public_session_probe_status": public_session.get("status"),
+            "public_session_maintained_expected_object_ids": public_session.get("maintained_expected_object_ids"),
+            "propagation": public_session.get("propagation", []),
         }
         _atomic_json(logs_dir / "summary.json", summary)
         print(json.dumps(summary, indent=2, ensure_ascii=True), flush=True)
-        return 0
+        return 0 if public_session_ok else 1
     except Exception as exc:
         payload = {
             "status": "failed",

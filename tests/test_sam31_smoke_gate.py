@@ -113,13 +113,13 @@ class Sam31SmokeGateTest(unittest.TestCase):
             self.assertFalse(gate["passed"], gate)
             self.assertTrue(any("never recovers" in error for error in gate["errors"]))
 
-    def test_make_submission_requires_sample_submission(self) -> None:
+    def test_sam31_make_submission_is_blocked(self) -> None:
         from scripts.run_sam31_vos import main
 
         with self.assertRaises(SystemExit) as raised:
             main(["--data-root", "/tmp/missing", "--output-dir", "/tmp/out", "--make-submission"])
 
-        self.assertIn("--sample-submission", str(raised.exception))
+        self.assertIn("SAM3.1 --make-submission is blocked", str(raised.exception))
 
     def test_full_quality_gate_fails_extra_empty_masks_vs_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
