@@ -11,6 +11,7 @@ import torch
 from PIL import Image
 
 from src.trackers.sam3_tracker_optional import (
+    SAM3_RUN_MODE_OFFICIAL,
     SAM3_RUN_MODE_FULL,
     SAM3_RUN_MODE_LOW_LEVEL,
     Sam3Availability,
@@ -22,6 +23,12 @@ from src.trackers.sam3_tracker_optional import (
 
 
 class FakeNativeSam31:
+    def __init__(self, drop_object_after_frame: int | None = None, empty_after_frame: int | None = None) -> None:
+        self.drop_object_after_frame = drop_object_after_frame
+        self.empty_after_frame = empty_after_frame
+        self.add_new_masks_calls = 0
+        self.added_object_ids: list[int] = []
+
     def init_state(self, video_path: str, **_: object) -> dict[str, object]:
         frame_count = len(list(Path(video_path).glob("*.jpg")))
         return {
@@ -34,6 +41,8 @@ class FakeNativeSam31:
         }
 
     def add_new_masks(self, inference_state: dict[str, object], frame_idx: int, obj_ids: list[int], masks: torch.Tensor, **_: object) -> None:
+        self.add_new_masks_calls += 1
+        self.added_object_ids = [int(object_id) for object_id in obj_ids]
         inference_state["obj_ids"] = list(obj_ids)
         inference_state["initial_masks"] = masks.float()
 
@@ -45,15 +54,22 @@ class FakeNativeSam31:
         output_dict = inference_state["output_dict"]
         assert isinstance(output_dict, dict)
         for frame_index in range(max_frame_num_to_track + 1):
-            logits = torch.where(initial > 0, torch.tensor(8.0), torch.tensor(-8.0)).unsqueeze(1)
-            scores = torch.full((len(object_ids), 1), 4.0)
+            frame_object_ids = list(object_ids)
+            if self.drop_object_after_frame is not None and frame_index >= self.drop_object_after_frame and len(frame_object_ids) > 1:
+                frame_object_ids = frame_object_ids[:-1]
+            mask_indices = [object_ids.index(object_id) for object_id in frame_object_ids]
+            frame_masks = initial[mask_indices] if mask_indices else initial[:0]
+            if self.empty_after_frame is not None and frame_index >= self.empty_after_frame:
+                frame_masks = torch.zeros_like(frame_masks)
+            logits = torch.where(frame_masks > 0, torch.tensor(8.0), torch.tensor(-8.0)).unsqueeze(1)
+            scores = torch.full((len(frame_object_ids), 1), 4.0)
             storage = "cond_frame_outputs" if frame_index == 0 else "non_cond_frame_outputs"
             output_dict[storage][frame_index] = {
                 "pred_masks": logits,
                 "object_score_logits": scores,
                 "iou_score": torch.full((len(object_ids), 1), 0.9),
             }
-            yield frame_index, object_ids, None, logits, scores
+            yield frame_index, frame_object_ids, None, logits, scores
 
 
 class FakeFullSam31Model:
@@ -262,10 +278,69 @@ class Sam31AdapterTest(unittest.TestCase):
         prompts = [{"prompt_type": "mask", "relative_path": mask_path.relative_to(root).as_posix()}]
         return video, prompts, annotation
 
-    def test_native_mask_path_and_first_frame_exactness(self) -> None:
+    def test_official_mask_api_path_and_first_frame_exactness(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             video, prompts, annotation = self._video(root)
+            predictor = FakeNativeSam31()
+            result = run_sam3_video_with_mask_prompt(
+                video,
+                prompts,
+                root / "outputs",
+                {
+                    "data_root": str(root),
+                    "cache_dir": str(root / "cache"),
+                    "predictor": predictor,
+                    "device": "cpu",
+                    "sam3_run_mode": SAM3_RUN_MODE_OFFICIAL,
+                    "prompt_mode": "mask",
+                    "resize_long_side": 0,
+                    "output_frame_stems": ["00000", "00001", "00002"],
+                    "save_native_scores": True,
+                },
+            )
+            self.assertEqual(result.status, "done", result.error)
+            self.assertEqual(result.object_ids, [1, 2])
+            self.assertEqual(predictor.add_new_masks_calls, 1)
+            self.assertEqual(predictor.added_object_ids, [1, 2])
+            self.assertTrue(result.first_frame_exact)
+            self.assertTrue(np.array_equal(np.asarray(Image.open(result.mask_paths[0])), annotation))
+            self.assertTrue(Path(result.native_scores_path or "").exists())
+            self.assertFalse(result.fallback_used)
+            self.assertFalse(result.diagnostics["private_state_used"])
+            self.assertEqual(result.diagnostics["sam3_official_api_path"], "add_new_masks")
+
+    def test_official_mask_api_missing_object_id_is_diagnosed_without_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video, prompts, _ = self._video(root)
+            result = run_sam3_video_with_mask_prompt(
+                video,
+                prompts,
+                root / "outputs",
+                {
+                    "data_root": str(root),
+                    "cache_dir": str(root / "cache"),
+                    "predictor": FakeNativeSam31(drop_object_after_frame=1),
+                    "device": "cpu",
+                    "sam3_run_mode": SAM3_RUN_MODE_OFFICIAL,
+                    "prompt_mode": "mask",
+                    "resize_long_side": 0,
+                    "output_frame_stems": ["00000", "00001", "00002"],
+                    "save_native_scores": True,
+                },
+            )
+            self.assertEqual(result.status, "done", result.error)
+            self.assertFalse(result.fallback_used)
+            self.assertEqual(result.diagnostics["internal_tracker_recovery_events"], [])
+            self.assertGreater(result.diagnostics["total_missing_output_frames"], 0)
+            self.assertEqual(result.diagnostics["per_object"]["2"]["first_missing_output_frame"], 1)
+            self.assertTrue(any("mask API omitted expected object IDs" in warning for warning in result.warnings))
+
+    def test_official_mask_api_rejects_previous_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video, prompts, _ = self._video(root)
             result = run_sam3_video_with_mask_prompt(
                 video,
                 prompts,
@@ -275,18 +350,14 @@ class Sam31AdapterTest(unittest.TestCase):
                     "cache_dir": str(root / "cache"),
                     "predictor": FakeNativeSam31(),
                     "device": "cpu",
-                    "sam3_run_mode": SAM3_RUN_MODE_LOW_LEVEL,
+                    "sam3_run_mode": SAM3_RUN_MODE_OFFICIAL,
                     "prompt_mode": "mask",
                     "resize_long_side": 0,
-                    "output_frame_stems": ["00000", "00001", "00002"],
-                    "save_native_scores": True,
+                    "sam3_empty_mask_policy": "previous",
                 },
             )
-            self.assertEqual(result.status, "done", result.error)
-            self.assertEqual(result.object_ids, [1, 2])
-            self.assertTrue(result.first_frame_exact)
-            self.assertTrue(np.array_equal(np.asarray(Image.open(result.mask_paths[0])), annotation))
-            self.assertTrue(Path(result.native_scores_path or "").exists())
+            self.assertEqual(result.status, "failed")
+            self.assertIn("official_mask_api does not allow", result.error or "")
 
     def test_missing_mask_api_fails_without_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -301,7 +372,7 @@ class Sam31AdapterTest(unittest.TestCase):
                     "cache_dir": str(root / "cache"),
                     "predictor": MissingMaskApi(),
                     "device": "cpu",
-                    "sam3_run_mode": SAM3_RUN_MODE_LOW_LEVEL,
+                    "sam3_run_mode": SAM3_RUN_MODE_OFFICIAL,
                     "prompt_mode": "mask",
                     "resize_long_side": 0,
                 },
@@ -324,6 +395,7 @@ class Sam31AdapterTest(unittest.TestCase):
                     "cache_dir": str(root / "cache"),
                     "predictor": predictor,
                     "device": "cpu",
+                    "sam3_run_mode": SAM3_RUN_MODE_FULL,
                     "prompt_mode": "mask",
                     "resize_long_side": 0,
                     "output_frame_stems": ["00000", "00001", "00002"],
@@ -478,10 +550,10 @@ class Sam31AdapterTest(unittest.TestCase):
             stabilized_mask = np.asarray(Image.open(result.mask_paths[1]))
             self.assertEqual(set(np.unique(stabilized_mask).tolist()), {0, 1, 2})
 
-    def test_build_prefers_full_predictor_builder(self) -> None:
-        fake_predictor = FakeFullSam31Predictor()
+    def test_build_defaults_to_official_mask_api_builder(self) -> None:
+        fake_model = FakeNativeSam31()
         fake_builder_mod = mock.Mock()
-        fake_builder_mod.build_sam3_multiplex_video_predictor.return_value = fake_predictor
+        fake_builder_mod.build_sam3_multiplex_video_model.return_value = fake_model
         status = Sam3Availability(True, "available")
 
         with mock.patch("src.trackers.sam3_tracker_optional.check_sam3_available", return_value=status), mock.patch(
@@ -491,10 +563,28 @@ class Sam31AdapterTest(unittest.TestCase):
             result = build_sam3_tracker(checkpoint_path="/tmp/sam3.1_multiplex.pt", device="cpu")
 
         self.assertTrue(result.available, result.error)
-        fake_builder_mod.build_sam3_multiplex_video_predictor.assert_called_once()
-        self.assertEqual(result.build_config["builder"], "build_sam3_multiplex_video_predictor")
+        fake_builder_mod.build_sam3_multiplex_video_model.assert_called_once()
+        self.assertEqual(result.build_config["builder"], "build_sam3_multiplex_video_model/add_new_masks")
 
-    def test_low_level_debug_cannot_make_submission(self) -> None:
+    def test_legacy_modes_cannot_make_submission(self) -> None:
+        from scripts.run_sam31_vos import main
+
+        for run_mode in ("low_level_debug", "full_predictor_mask"):
+            with self.subTest(run_mode=run_mode), self.assertRaises(SystemExit) as raised:
+                main(
+                    [
+                        "--data-root",
+                        "/tmp/missing",
+                        "--output-dir",
+                        "/tmp/out",
+                        "--sam3-run-mode",
+                        run_mode,
+                        "--make-submission",
+                    ]
+                )
+            self.assertIn("official_mask_api", str(raised.exception))
+
+    def test_official_cli_rejects_previous_policy(self) -> None:
         from scripts.run_sam31_vos import main
 
         with self.assertRaises(SystemExit) as raised:
@@ -505,11 +595,12 @@ class Sam31AdapterTest(unittest.TestCase):
                     "--output-dir",
                     "/tmp/out",
                     "--sam3-run-mode",
-                    "low_level_debug",
-                    "--make-submission",
+                    "official_mask_api",
+                    "--sam3-empty-mask-policy",
+                    "previous",
                 ]
             )
-        self.assertIn("full_predictor_mask", str(raised.exception))
+        self.assertIn("official_mask_api does not allow", str(raised.exception))
 
     def test_full_multiplex_checkpoint_key_remap(self) -> None:
         model = TinyTrackerState()

@@ -1,9 +1,9 @@
-"""Probe SAM 3.1 full-predictor mask conditioning state.
+"""Probe SAM 3.1 official mask API state.
 
 This script is intentionally diagnostic-only. It builds the official SAM 3.1
-full video predictor, conditions one short real SUFE video with the complete
-first-frame mask, and writes compact JSON snapshots of the predictor API,
-state keys, tracker metadata, action history, and first propagation outputs.
+mask/VOS model, conditions one short real SUFE video with the complete
+first-frame mask through add_new_masks, and writes compact JSON snapshots of
+the API, state keys, and first propagation outputs.
 It does not create masks or a submission.
 """
 
@@ -39,21 +39,16 @@ from src.trackers.sam2_tracker import (
 from src.trackers.sam3_tracker_optional import (
     SAM31_CHECKPOINT_NAME,
     SAM31_HF_REPO,
-    SAM3_RUN_MODE_FULL,
+    SAM3_RUN_MODE_OFFICIAL,
     _call_supported,
-    _full_internal_tracker_outputs,
-    _full_predictor_model,
-    _init_full_predictor_mask_state,
     _initialize_native_state,
     _normalize_propagation_item,
     _reorder_objects,
     _reorder_scores,
     _runtime_version,
     _session_frame_dir,
-    _set_full_predictor_tracking_bounds,
     _sigmoid,
     _state_summary,
-    _to_numpy,
     build_sam3_tracker,
     install_sam3_if_requested,
 )
@@ -77,7 +72,7 @@ API_KEYWORDS = (
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Debug SAM 3.1 full predictor mask-conditioning state.")
+    parser = argparse.ArgumentParser(description="Debug SAM 3.1 official add_new_masks state.")
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--experiment-id", default=f"sam31_api_probe_{dt.datetime.now():%Y%m%d_%H%M%S}")
@@ -518,7 +513,111 @@ def _checkpoint_key_summary(checkpoint: Path | None, model: Any | None = None) -
     return summary
 
 
-def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any) -> dict[str, Any]:
+def _mask_center_and_box(mask: np.ndarray) -> tuple[list[float], list[float]]:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0 or len(ys) == 0:
+        raise RuntimeError("Cannot create a public-session point prompt from an empty object mask")
+    x0, x1 = float(xs.min()), float(xs.max() + 1)
+    y0, y1 = float(ys.min()), float(ys.max() + 1)
+    return [(x0 + x1) / 2.0, (y0 + y1) / 2.0], [x0, y0, x1 - x0, y1 - y0]
+
+
+def _probe_public_session(
+    args: argparse.Namespace,
+    checkpoint: Path | None,
+    frame_dir: Path,
+    annotation: np.ndarray,
+    object_ids: list[int],
+    target_frame_count: int,
+) -> dict[str, Any]:
+    """Best-effort check of the official interactive session API.
+
+    This is intentionally diagnostic-only. The submission path remains the
+    complete-mask add_new_masks API.
+    """
+
+    try:
+        import importlib
+        import torch
+
+        builder_mod = importlib.import_module("sam3.model_builder")
+        builder = getattr(builder_mod, "build_sam3_multiplex_video_predictor")
+        predictor = builder(
+            checkpoint_path=str(checkpoint) if checkpoint else None,
+            max_num_objects=max(16, int(args.multiplex_count)),
+            multiplex_count=max(1, int(args.multiplex_count)),
+            use_fa3=bool(args.use_fa3),
+            use_rope_real=bool(args.use_rope_real),
+            compile=bool(args.compile),
+            warm_up=False,
+            default_output_prob_thresh=0.5,
+            async_loading_frames=False,
+        )
+        start = predictor.handle_request(
+            request={"type": "start_session", "resource_path": str(frame_dir)}
+        )
+        session_id = start["session_id"]
+        object_id = int(object_ids[0])
+        point_abs, box_abs = _mask_center_and_box(annotation == object_id)
+        height, width = annotation.shape[:2]
+        point_rel = [[point_abs[0] / width, point_abs[1] / height]]
+        box_rel = [[box_abs[0] / width, box_abs[1] / height, box_abs[2] / width, box_abs[3] / height]]
+        add = predictor.handle_request(
+            request={
+                "type": "add_prompt",
+                "session_id": session_id,
+                "frame_index": 0,
+                "points": torch.tensor(point_rel, dtype=torch.float32),
+                "point_labels": torch.tensor([1], dtype=torch.int32),
+                "obj_id": object_id,
+            }
+        )
+        stream_rows: list[dict[str, Any]] = []
+        for response in predictor.handle_stream_request(
+            request={"type": "propagate_in_video", "session_id": session_id}
+        ):
+            row = {
+                "frame_index": int(response.get("frame_index", response.get("frame_idx", len(stream_rows)))),
+                "output_keys": sorted(response.get("outputs", {}).keys()) if isinstance(response.get("outputs"), Mapping) else [],
+            }
+            try:
+                frame_idx, output_ids, logits, _scores = _normalize_propagation_item(response)
+                row.update(
+                    {
+                        "normalized_frame_index": int(frame_idx),
+                        "output_object_ids": [int(value) for value in output_ids],
+                        "mask_shape": list(logits.shape),
+                    }
+                )
+            except Exception as exc:
+                row["normalize_error"] = f"{type(exc).__name__}: {exc}"
+            stream_rows.append(row)
+            if len(stream_rows) >= target_frame_count:
+                break
+        try:
+            predictor.handle_request(request={"type": "reset_session", "session_id": session_id})
+        except Exception:
+            pass
+        return {
+            "status": "done",
+            "prompt": "single_positive_point_from_first_object_center",
+            "object_id": object_id,
+            "point_abs": point_abs,
+            "point_rel": point_rel[0],
+            "box_abs_reference": box_abs,
+            "box_rel_reference": box_rel[0],
+            "add_prompt_output_keys": sorted(add.get("outputs", {}).keys()) if isinstance(add.get("outputs"), Mapping) else [],
+            "propagation": stream_rows,
+        }
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": traceback.format_exc(),
+        }
+
+
+def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any, checkpoint: Path | None) -> dict[str, Any]:
     import torch
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -551,54 +650,41 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
     )
     snapshots = [_state_snapshot(state, object_ids, model, "after_init_state")]
 
-    mask_tensor = torch.from_numpy(np.stack([object_masks[object_id] for object_id in object_ids])).float()
+    mask_tensor = torch.from_numpy(np.stack([object_masks[object_id] for object_id in object_ids])).bool()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     autocast = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if device.startswith("cuda") else torch.no_grad()
     propagation_rows: list[dict[str, Any]] = []
     conditioning_info: dict[str, Any] = {}
     with torch.inference_mode(), autocast:
-        _set_full_predictor_tracking_bounds(state, 0, target_frame_count - 1)
-        snapshots.append(_state_snapshot(state, object_ids, model, "after_tracking_bounds_before_conditioning"))
-        conditioning_info = _init_full_predictor_mask_state(model, state, 0, object_ids, mask_tensor)
+        model.add_new_masks(
+            inference_state=state,
+            frame_idx=0,
+            obj_ids=object_ids,
+            masks=mask_tensor,
+            add_mask_to_memory=True,
+        )
+        conditioning_info = {
+            "mask_conditioning": "official_add_new_masks",
+            "num_conditioned_objects": len(object_ids),
+            "conditioned_object_ids": [int(object_id) for object_id in object_ids],
+            "cached_conditioning_frames": [0],
+            "private_state_used": False,
+        }
         snapshots.append(_state_snapshot(state, object_ids, model, "after_mask_conditioning"))
-        _set_full_predictor_tracking_bounds(state, 0, target_frame_count - 1)
         propagation = _call_supported(
             model.propagate_in_video,
             inference_state=state,
             start_frame_idx=0,
             max_frame_num_to_track=target_frame_count - 1,
             reverse=False,
-            output_prob_thresh=0.5,
-            is_last_batch=True,
+            tqdm_disable=True,
+            run_mem_encoder=True,
         )
         for item in propagation:
             frame_idx, output_ids, logits, object_scores = _normalize_propagation_item(item)
             if frame_idx < 0 or frame_idx >= target_frame_count:
                 continue
             raw_output_ids = [int(object_id) for object_id in output_ids]
-            recovery_info: dict[str, Any] | None = None
-            recovered = None
-            missing_before_recovery = sorted(set(object_ids) - set(raw_output_ids))
-            if missing_before_recovery:
-                recovered = _full_internal_tracker_outputs(state, frame_idx, object_ids)
-                if recovered is not None:
-                    recovered_ids, recovered_logits, recovered_scores = recovered
-                    recovery_info = {
-                        "available": True,
-                        "recovered_object_ids": [int(object_id) for object_id in recovered_ids],
-                        "mask_shape": list(recovered_logits.shape),
-                        "per_object_positive_pixels": [
-                            int((recovered_logits[index] > 0).sum())
-                            for index in range(recovered_logits.shape[0])
-                        ],
-                        "object_score_logits": (
-                            [float(value) for value in recovered_scores.reshape(-1).tolist()]
-                            if recovered_scores is not None
-                            else None
-                        ),
-                    }
-                else:
-                    recovery_info = {"available": False}
             reordered_logits = _reorder_objects(logits, raw_output_ids, object_ids, allow_missing=True)
             reordered_scores = _reorder_scores(object_scores, raw_output_ids, object_ids, allow_missing=True)
             object_rows: list[dict[str, Any]] = []
@@ -627,7 +713,7 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
                     "raw_output_object_ids": raw_output_ids,
                     "missing_expected_object_ids": sorted(set(object_ids) - set(raw_output_ids)),
                     "extra_object_ids": sorted(set(raw_output_ids) - set(object_ids)),
-                    "internal_tracker_recovery": recovery_info,
+                    "internal_tracker_recovery": None,
                     "objects": object_rows,
                     "raw_item_type": type(item).__module__ + "." + type(item).__name__,
                 }
@@ -658,6 +744,14 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
         "conditioning_info": conditioning_info,
         "propagation": propagation_rows,
         "snapshots": snapshots,
+        "public_session_probe": _probe_public_session(
+            args,
+            checkpoint,
+            frame_dir,
+            annotation,
+            object_ids,
+            target_frame_count,
+        ),
     }
 
 
@@ -689,7 +783,7 @@ def main(argv: list[str] | None = None) -> int:
             use_rope_real=args.use_rope_real,
             compile_model=args.compile,
             strict_runtime=not args.allow_unsupported_runtime,
-            run_mode=SAM3_RUN_MODE_FULL,
+            run_mode=SAM3_RUN_MODE_OFFICIAL,
         )
         if not build.available or build.predictor is None:
             payload = {"status": "failed_build", "checkpoint": str(checkpoint), "build": build.to_dict()}
@@ -697,8 +791,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(payload, indent=2, ensure_ascii=True))
             return 1
 
-        predictor = build.predictor
-        model = _full_predictor_model(predictor)
+        model = build.predictor
         api_payload = {
             "status": "built",
             "experiment_id": args.experiment_id,
@@ -707,16 +800,16 @@ def main(argv: list[str] | None = None) -> int:
             "checkpoint_keys": _checkpoint_key_summary(checkpoint, model),
             "model_state_keys": _model_state_key_summary(model),
             "build": build.to_dict(),
-            "predictor_class": f"{type(predictor).__module__}.{type(predictor).__name__}",
+            "private_state_used": False,
+            "sam3_official_api_path": "add_new_masks",
             "model_class": f"{type(model).__module__}.{type(model).__name__}",
             "runtime": _runtime_version(model),
-            "predictor_callables": _callable_inventory(predictor),
             "model_callables": _callable_inventory(model),
         }
         _atomic_json(logs_dir / "sam31_api_introspection.json", api_payload)
 
         video = _select_video(Path(args.data_root).expanduser().resolve(), args.video_id)
-        probe_payload = _probe_state(args, exp_dir, model, video)
+        probe_payload = _probe_state(args, exp_dir, model, video, checkpoint)
         _atomic_json(logs_dir / "sam31_state_probe.json", probe_payload)
 
         summary = {
@@ -726,21 +819,15 @@ def main(argv: list[str] | None = None) -> int:
             "state_probe": str(logs_dir / "sam31_state_probe.json"),
             "video_id": args.video_id,
             "object_ids": probe_payload["object_ids"],
+            "mask_api_path": "add_new_masks",
+            "private_state_used": False,
+            "public_session_probe_status": probe_payload.get("public_session_probe", {}).get("status"),
             "propagation": [
                 {
                     "frame_index": row["frame_index"],
                     "raw_output_object_ids": row["raw_output_object_ids"],
                     "missing_expected_object_ids": row["missing_expected_object_ids"],
-                    "internal_tracker_recovery": (
-                        {
-                            "available": bool(row["internal_tracker_recovery"].get("available")),
-                            "recovered_object_ids": row["internal_tracker_recovery"].get("recovered_object_ids"),
-                            "per_object_positive_pixels": row["internal_tracker_recovery"].get("per_object_positive_pixels"),
-                            "object_score_logits": row["internal_tracker_recovery"].get("object_score_logits"),
-                        }
-                        if isinstance(row.get("internal_tracker_recovery"), Mapping)
-                        else None
-                    ),
+                    "internal_tracker_recovery": None,
                 }
                 for row in probe_payload["propagation"]
             ],

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -34,6 +36,7 @@ from src.trackers.sam3_tracker_optional import (
     SAM3_EMPTY_MASK_POLICY_EMPTY,
     SAM3_INDEXED_ABSENCE_POLICIES,
     SAM3_INDEXED_ABSENCE_POLICY_EMPTY,
+    SAM3_RUN_MODE_OFFICIAL,
     SAM3_RUN_MODE_FULL,
     SAM3_RUN_MODE_LOW_LEVEL,
     SAM3_RUN_MODES,
@@ -57,9 +60,9 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--prompt-mode", default="mask", choices=["mask"])
     parser.add_argument(
         "--sam3-run-mode",
-        default=SAM3_RUN_MODE_FULL,
+        default=SAM3_RUN_MODE_OFFICIAL,
         choices=SAM3_RUN_MODES,
-        help="SAM 3.1 backend mode. Only full_predictor_mask is allowed for submissions.",
+        help="SAM 3.1 backend mode. Only official_mask_api is allowed for submissions.",
     )
     parser.add_argument("--original-resolution", action="store_true", help="Explicitly document original-resolution inference.")
     parser.add_argument("--video-ids", help="Comma-separated video IDs for smoke or split runs.")
@@ -497,10 +500,39 @@ def _resolve_checkpoint(args: argparse.Namespace, exp_dir: Path) -> Path | None:
     ).resolve()
 
 
+def _sha256_file(path: Path | None) -> str | None:
+    if path is None or not path.exists() or not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sam3_repo_commit(repo_dir_text: str | None) -> str | None:
+    if not repo_dir_text:
+        return None
+    repo_dir = Path(repo_dir_text).expanduser()
+    if not repo_dir.exists():
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return None
+    commit = result.stdout.strip()
+    return commit or None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    if args.make_submission and args.sam3_run_mode != SAM3_RUN_MODE_FULL:
-        raise SystemExit("--make-submission is only allowed with --sam3-run-mode full_predictor_mask")
+    if args.make_submission and args.sam3_run_mode != SAM3_RUN_MODE_OFFICIAL:
+        raise SystemExit("--make-submission is only allowed with --sam3-run-mode official_mask_api")
     if args.make_submission and not args.sample_submission:
         raise SystemExit("--make-submission requires --sample-submission for strict format validation")
     if args.make_submission and args.sample_submission and not Path(args.sample_submission).expanduser().exists():
@@ -509,6 +541,11 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--make-submission cannot be combined with --max-frames")
     if args.make_submission and (args.max_videos or args.video_ids or args.video_ids_file):
         raise SystemExit("Partial video selection cannot create a final submission")
+    if args.sam3_run_mode == SAM3_RUN_MODE_OFFICIAL and (
+        args.sam3_empty_mask_policy != SAM3_EMPTY_MASK_POLICY_EMPTY
+        or args.sam3_indexed_absence_policy != SAM3_INDEXED_ABSENCE_POLICY_EMPTY
+    ):
+        raise SystemExit("official_mask_api does not allow previous-mask diagnostic policies")
 
     data_root = Path(args.data_root).expanduser().resolve()
     exp_dir = Path(args.output_dir).expanduser().resolve() / args.experiment_id
@@ -571,23 +608,41 @@ def main(argv: list[str] | None = None) -> int:
         strict_runtime=not args.allow_unsupported_runtime,
         run_mode=args.sam3_run_mode,
     )
+    if args.sam3_run_mode == SAM3_RUN_MODE_OFFICIAL:
+        mask_conditioning_path = "official_add_new_masks"
+        fallback_policy = "fail_without_internal_recovery"
+        internal_tracker_recovery_enabled = False
+        private_state_used = False
+        sam3_official_api_path = "add_new_masks"
+    elif args.sam3_run_mode == SAM3_RUN_MODE_FULL:
+        mask_conditioning_path = "legacy_full_predictor_private_tracker_add_new_objects"
+        fallback_policy = (
+            "recover_internal_tracker_logits_before_quality_gate"
+            if not args.disable_internal_tracker_recovery
+            else "fail_without_fallback"
+        )
+        internal_tracker_recovery_enabled = not args.disable_internal_tracker_recovery
+        private_state_used = True
+        sam3_official_api_path = None
+    else:
+        mask_conditioning_path = "low_level_debug_add_new_masks_rejected_for_submission"
+        fallback_policy = "debug_only_no_submission"
+        internal_tracker_recovery_enabled = False
+        private_state_used = False
+        sam3_official_api_path = "add_new_masks"
     manifest = {
         "experiment_id": args.experiment_id,
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "backend": "sam3.1_object_multiplex",
         "sam3_run_mode": args.sam3_run_mode,
-        "mask_conditioning_path": (
-            "official_full_predictor_private_tracker_add_new_objects"
-            if args.sam3_run_mode == SAM3_RUN_MODE_FULL
-            else "low_level_debug_add_new_masks_rejected_for_submission"
-        ),
+        "mask_conditioning_path": mask_conditioning_path,
+        "sam3_official_api_path": sam3_official_api_path,
+        "private_state_used": private_state_used,
         "prompt_mode": "mask",
         "original_resolution": True,
         "first_frame_policy": "copy_input_annotation_exactly",
-        "fallback_policy": "recover_internal_tracker_logits_before_quality_gate"
-        if not args.disable_internal_tracker_recovery
-        else "fail_without_fallback",
-        "internal_tracker_recovery_enabled": not args.disable_internal_tracker_recovery,
+        "fallback_policy": fallback_policy,
+        "internal_tracker_recovery_enabled": internal_tracker_recovery_enabled,
         "empty_mask_policy": args.sam3_empty_mask_policy,
         "indexed_absence_policy": args.sam3_indexed_absence_policy,
         "native_scores_requested": bool(args.save_native_scores),
@@ -601,8 +656,10 @@ def main(argv: list[str] | None = None) -> int:
         "selected_videos": [video.video_id for video in selected],
         "max_frames": args.max_frames,
         "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+        "checkpoint_sha256": _sha256_file(checkpoint_path),
         "hf_repo_id": args.hf_repo_id,
         "checkpoint_filename": args.checkpoint_filename,
+        "sam3_repo_commit": _sam3_repo_commit(args.sam3_repo_dir),
         "arguments": vars(args),
         "build": build.to_dict(),
     }
@@ -643,7 +700,9 @@ def main(argv: list[str] | None = None) -> int:
                 "max_frames": args.max_frames,
                 "offload_video_to_cpu": args.offload_video_to_cpu,
                 "offload_state_to_cpu": args.offload_state_to_cpu,
-                "sam3_recover_internal_tracker_outputs": not args.disable_internal_tracker_recovery,
+                "sam3_recover_internal_tracker_outputs": (
+                    args.sam3_run_mode == SAM3_RUN_MODE_FULL and not args.disable_internal_tracker_recovery
+                ),
                 "sam3_empty_mask_policy": args.sam3_empty_mask_policy,
                 "sam3_indexed_absence_policy": args.sam3_indexed_absence_policy,
                 "save_native_scores": args.save_native_scores,

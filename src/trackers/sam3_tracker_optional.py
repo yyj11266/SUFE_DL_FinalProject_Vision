@@ -44,9 +44,10 @@ from src.trackers.sam2_tracker import (
 SAM3_REPO_URL = "https://github.com/facebookresearch/sam3.git"
 SAM31_HF_REPO = "research21/sam3.1"
 SAM31_CHECKPOINT_NAME = "sam3.1_multiplex.pt"
+SAM3_RUN_MODE_OFFICIAL = "official_mask_api"
 SAM3_RUN_MODE_FULL = "full_predictor_mask"
 SAM3_RUN_MODE_LOW_LEVEL = "low_level_debug"
-SAM3_RUN_MODES = (SAM3_RUN_MODE_FULL, SAM3_RUN_MODE_LOW_LEVEL)
+SAM3_RUN_MODES = (SAM3_RUN_MODE_OFFICIAL, SAM3_RUN_MODE_FULL, SAM3_RUN_MODE_LOW_LEVEL)
 SAM3_EMPTY_MASK_POLICY_EMPTY = "empty"
 SAM3_EMPTY_MASK_POLICY_PREVIOUS = "previous"
 SAM3_EMPTY_MASK_POLICIES = (SAM3_EMPTY_MASK_POLICY_EMPTY, SAM3_EMPTY_MASK_POLICY_PREVIOUS)
@@ -245,8 +246,8 @@ def check_sam3_available(
         video_builder = hasattr(builder_mod, "build_sam3_multiplex_video_predictor")
         low_level_video_builder = hasattr(builder_mod, "build_sam3_multiplex_video_model")
         image_builder = hasattr(builder_mod, "build_sam3_image_model")
-        if not video_builder:
-            errors.append("sam3.model_builder.build_sam3_multiplex_video_predictor is missing")
+        if not low_level_video_builder:
+            errors.append("sam3.model_builder.build_sam3_multiplex_video_model is missing")
     except Exception as exc:
         import_error = f"{type(exc).__name__}: {exc}"
         errors.append(f"Could not import sam3.model_builder: {import_error}")
@@ -274,7 +275,7 @@ def check_sam3_available(
     requested_device_available = not str(device).startswith("cuda") or cuda_available
     version_gate = (python_ok and torch_ok and cuda_ok) if strict_runtime else True
     available = bool(
-        video_builder
+        low_level_video_builder
         and torch_available
         and requested_device_available
         and version_gate
@@ -288,7 +289,7 @@ def check_sam3_available(
         reason=reason,
         warnings=warnings,
         sam3_importable=True,
-        video_builder_available=video_builder,
+        video_builder_available=low_level_video_builder,
         full_predictor_builder_available=video_builder,
         low_level_video_builder_available=low_level_video_builder,
         image_builder_available=image_builder,
@@ -508,6 +509,8 @@ def _patch_native_tracker_forward_image_for_mask_tracking(model: Any) -> None:
 
     if getattr(model, "_sufe_forward_image_mask_tracking_patch", False):
         return
+    if not callable(getattr(model, "forward_image", None)):
+        return
     original_forward_image = model.forward_image
 
     def forward_image_mask_tracking(*args: Any, **kwargs: Any) -> Any:
@@ -528,7 +531,7 @@ def build_sam3_tracker(
     use_rope_real: bool = False,
     compile_model: bool = False,
     strict_runtime: bool = True,
-    run_mode: str = SAM3_RUN_MODE_FULL,
+    run_mode: str = SAM3_RUN_MODE_OFFICIAL,
 ) -> Sam3TrackerBuildResult:
     """Build the official SAM 3.1 Object Multiplex tracking model."""
 
@@ -584,6 +587,7 @@ def build_sam3_tracker(
                 build_config=failed_config,
             )
 
+    official_builder = run_mode == SAM3_RUN_MODE_OFFICIAL
     low_level_config = {
         **config,
         "load_from_HF": checkpoint_path is None,
@@ -598,7 +602,11 @@ def build_sam3_tracker(
         _require_native_api(model)
         _patch_native_tracker_forward_image_for_mask_tracking(model)
         status.native_mask_api = True
-        low_level_config["builder"] = "build_sam3_multiplex_video_model/low_level_debug"
+        low_level_config["builder"] = (
+            "build_sam3_multiplex_video_model/add_new_masks"
+            if official_builder
+            else "build_sam3_multiplex_video_model/low_level_debug"
+        )
         return Sam3TrackerBuildResult(
             True,
             predictor=model,
@@ -608,6 +616,16 @@ def build_sam3_tracker(
         )
     except Exception as exc:
         direct_error = _short_error(exc)
+        if official_builder:
+            failed_config = dict(low_level_config)
+            failed_config["builder"] = "build_sam3_multiplex_video_model/add_new_masks"
+            return Sam3TrackerBuildResult(
+                False,
+                status=status,
+                warnings=status.warnings,
+                error=direct_error,
+                build_config=failed_config,
+            )
         if checkpoint_path:
             try:
                 builder_mod = importlib.import_module("sam3.model_builder")
@@ -1336,11 +1354,13 @@ def run_sam3_video_with_mask_prompt(
 ) -> Sam3VideoResult:
     """Run SAM 3.1 with complete first-frame masks for all objects."""
 
-    run_mode = str(config.get("sam3_run_mode", SAM3_RUN_MODE_FULL))
+    run_mode = str(config.get("sam3_run_mode", SAM3_RUN_MODE_OFFICIAL))
+    if run_mode == SAM3_RUN_MODE_OFFICIAL:
+        return _run_sam3_official_mask_api_video_with_mask_prompt(video_info, init_prompts, output_dir, config)
     if run_mode == SAM3_RUN_MODE_FULL:
         return _run_sam3_full_predictor_video_with_mask_prompt(video_info, init_prompts, output_dir, config)
     if run_mode == SAM3_RUN_MODE_LOW_LEVEL:
-        return _run_sam3_low_level_video_with_mask_prompt(video_info, init_prompts, output_dir, config)
+        return _run_sam3_official_mask_api_video_with_mask_prompt(video_info, init_prompts, output_dir, config)
     return Sam3VideoResult(
         video_id=_video_id(video_info),
         status="failed",
@@ -1833,13 +1853,13 @@ def _run_sam3_full_predictor_video_with_mask_prompt(
             pass
 
 
-def _run_sam3_low_level_video_with_mask_prompt(
+def _run_sam3_official_mask_api_video_with_mask_prompt(
     video_info: Any,
     init_prompts: Iterable[Any],
     output_dir: str | Path,
     config: dict[str, Any],
 ) -> Sam3VideoResult:
-    """Run native SAM 3.1 with complete first-frame masks for all objects."""
+    """Run official SAM 3.1 mask API with complete first-frame masks."""
 
     video_id = _video_id(video_info)
     output_root = Path(output_dir).expanduser().resolve()
@@ -1858,6 +1878,13 @@ def _run_sam3_low_level_video_with_mask_prompt(
             raise ValueError("SAM 3.1 baseline only supports --prompt-mode mask")
         if int(config.get("resize_long_side", 0) or 0) != 0:
             raise ValueError("SAM 3.1 native baseline requires original resolution")
+        empty_mask_policy = str(config.get("sam3_empty_mask_policy", SAM3_EMPTY_MASK_POLICY_EMPTY)).lower()
+        indexed_absence_policy = str(config.get("sam3_indexed_absence_policy", SAM3_INDEXED_ABSENCE_POLICY_EMPTY)).lower()
+        if empty_mask_policy != SAM3_EMPTY_MASK_POLICY_EMPTY or indexed_absence_policy != SAM3_INDEXED_ABSENCE_POLICY_EMPTY:
+            raise ValueError(
+                "SAM 3.1 official_mask_api does not allow previous-mask diagnostic policies; "
+                "use full_predictor_mask only for legacy diagnostics."
+            )
 
         prepared_frames = _prepare_frame_dir(video_info, config)
         max_frames = int(config.get("max_frames", 0) or 0)
@@ -1900,6 +1927,7 @@ def _run_sam3_low_level_video_with_mask_prompt(
         raw_logit_paths: list[str] = []
         seen_frames: set[int] = set()
         previous_indexed: np.ndarray | None = None
+        diagnostics = _init_object_diagnostics(object_ids, target_frame_count, allow_missing_objects=True)
 
         with torch.inference_mode(), autocast:
             model.add_new_masks(
@@ -1923,8 +1951,10 @@ def _run_sam3_low_level_video_with_mask_prompt(
                     continue
                 if frame_idx in seen_frames:
                     raise RuntimeError(f"SAM 3.1 returned frame {frame_idx} more than once")
-                logits = _reorder_objects(logits, output_ids, object_ids)
-                object_scores = _reorder_scores(object_scores, output_ids, object_ids)
+                raw_output_ids = list(output_ids)
+                logits = _reorder_objects(logits, output_ids, object_ids, allow_missing=True)
+                object_scores = _reorder_scores(object_scores, output_ids, object_ids, allow_missing=True)
+                _record_object_diagnostics(diagnostics, frame_idx, object_ids, raw_output_ids, logits, object_scores)
                 frame = prepared_frames[frame_idx]
 
                 if frame_idx == 0:
@@ -1970,6 +2000,23 @@ def _run_sam3_low_level_video_with_mask_prompt(
         if not first_frame_exact:
             raise RuntimeError("Saved first-frame mask is not pixel-identical to the input annotation")
 
+        diagnostics = _finalize_object_diagnostics(diagnostics)
+        diagnostics["internal_tracker_recovery_events"] = []
+        diagnostics["internal_tracker_recovery_frames"] = 0
+        diagnostics["empty_mask_policy"] = empty_mask_policy
+        diagnostics["empty_mask_policy_events"] = []
+        diagnostics["empty_mask_policy_frames"] = 0
+        diagnostics["indexed_absence_policy"] = indexed_absence_policy
+        diagnostics["indexed_absence_policy_events"] = []
+        diagnostics["indexed_absence_policy_frames"] = 0
+        diagnostics["sam3_official_api_path"] = "add_new_masks"
+        diagnostics["private_state_used"] = False
+        if diagnostics.get("total_missing_output_frames"):
+            warnings.append(
+                "The official SAM 3.1 mask API omitted expected object IDs in "
+                f"{diagnostics['total_missing_output_frames']} frame/object case(s); see diagnostics."
+            )
+
         version = _runtime_version(model)
         if bool(config.get("save_native_scores", False)):
             if rows and all(row["predicted_iou"] is None for row in rows):
@@ -1978,9 +2025,18 @@ def _run_sam3_low_level_video_with_mask_prompt(
                     "the JSONL field is null and inference behavior was left unchanged."
                 )
             _write_jsonl(scores_path, rows)
+            state_summary = _state_summary(state, object_ids, version)
+            state_summary["backend_mode"] = SAM3_RUN_MODE_OFFICIAL
+            state_summary["mask_conditioning"] = {
+                "mask_conditioning": "official_add_new_masks",
+                "num_conditioned_objects": len(object_ids),
+                "conditioned_object_ids": [int(object_id) for object_id in object_ids],
+                "cached_conditioning_frames": [0],
+                "private_state_used": False,
+            }
             state_path.parent.mkdir(parents=True, exist_ok=True)
             state_path.write_text(
-                json.dumps(_state_summary(state, object_ids, version), indent=2, ensure_ascii=True),
+                json.dumps(state_summary, indent=2, ensure_ascii=True),
                 encoding="utf-8",
             )
         return Sam3VideoResult(
@@ -1995,6 +2051,7 @@ def _run_sam3_low_level_video_with_mask_prompt(
             native_state_path=str(state_path) if config.get("save_native_scores") else None,
             warnings=warnings,
             first_frame_exact=True,
+            diagnostics=diagnostics,
         )
     except Exception as exc:
         return Sam3VideoResult(

@@ -44,7 +44,7 @@ python scripts/run_sam31_vos.py \
   --data-root /content/sufe_data/video_dataset \
   --sample-submission /content/drive/MyDrive/sufe_vos_inputs/sample_submission.zip \
   --output-dir /content/sufe_runs \
-  --experiment-id sam31_native_full \
+  --experiment-id sam31_official_mask_api_full \
   --hf-repo-id research21/sam3.1 \
   --sam3-repo-dir /content/sam3 \
   --prompt-mode mask \
@@ -60,7 +60,7 @@ all first-frame objects from their complete masks, copies frame zero exactly,
 keeps object IDs fixed, saves native presence/IoU fields when exposed, and
 never falls back to points or SAM2.
 
-Before a full SAM 3.1 run, probe the official full predictor state flow on one
+Before a full SAM 3.1 run, probe the official `add_new_masks` state flow on one
 short real video:
 
 ```bash
@@ -78,13 +78,9 @@ This writes `logs/sam31_api_introspection.json` and
 `logs/sam31_state_probe.json` without creating a submission.
 The Colab notebook also copies these probe JSON files to
 `MyDrive/sufe_vos_review/runs/EXP_ID/` for Codex review.
-For a diagnostic smoke rerun after an empty-mask collapse, set
-`SAM31_EMPTY_MASK_POLICY=previous` in Colab. This holds the previous object mask
-only when SAM3.1 emits an empty object mask. The smoke notebook then defaults
-`SAM31_INDEXED_ABSENCE_POLICY` to the same value, which also restores an object
-if it disappears only after indexed-mask composition. Both policies record every
-event in diagnostics and should not be treated as submission policies without
-contact-sheet review.
+The submission path uses `official_mask_api` and rejects previous-mask
+diagnostic policies. Legacy `full_predictor_mask` runs may still be used for
+state debugging, but they are blocked from `--make-submission`.
 
 Create the frozen MOSEv2 split:
 
