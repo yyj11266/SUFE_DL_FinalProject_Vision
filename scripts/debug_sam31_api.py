@@ -42,7 +42,6 @@ from src.trackers.sam2_tracker import (
 from src.trackers.sam3_tracker_optional import (
     SAM31_CHECKPOINT_NAME,
     SAM31_HF_REPO,
-    SAM3_RUN_MODE_OFFICIAL,
     _call_supported,
     _initialize_native_state,
     _normalize_propagation_item,
@@ -52,7 +51,6 @@ from src.trackers.sam3_tracker_optional import (
     _session_frame_dir,
     _sigmoid,
     _state_summary,
-    build_sam3_tracker,
     install_sam3_if_requested,
 )
 
@@ -948,6 +946,8 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
         torch.cuda.empty_cache()
 
     return {
+        "status": "done",
+        "api_path": "full_predictor_model.add_new_masks",
         "video_id": video.video_id,
         "target_frame_count": target_frame_count,
         "frame_dir": str(frame_dir),
@@ -961,6 +961,46 @@ def _probe_state(args: argparse.Namespace, exp_dir: Path, model: Any, video: Any
         "propagation": propagation_rows,
         "snapshots": snapshots,
         "checkpoint": str(checkpoint) if checkpoint else None,
+    }
+
+
+def _mask_probe_summary(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not payload:
+        return {
+            "status": "not_run",
+            "maintained_expected_object_ids": None,
+            "first_missing_frame": None,
+            "empty_non_initial_frames": None,
+        }
+    if payload.get("status") != "done":
+        return {
+            "status": str(payload.get("status", "failed")),
+            "maintained_expected_object_ids": False,
+            "first_missing_frame": None,
+            "empty_non_initial_frames": None,
+        }
+    expected = set(int(object_id) for object_id in payload.get("object_ids", []))
+    propagation = payload.get("propagation", [])
+    rows = propagation if isinstance(propagation, list) else []
+    first_missing_frame: int | None = None
+    empty_non_initial_frames = 0
+    maintained = bool(rows) and bool(expected)
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        frame_idx = int(row.get("frame_index", -1))
+        output_ids = set(int(object_id) for object_id in row.get("raw_output_object_ids", []))
+        if frame_idx > 0 and not output_ids:
+            empty_non_initial_frames += 1
+        if expected and not expected.issubset(output_ids):
+            maintained = False
+            if first_missing_frame is None:
+                first_missing_frame = frame_idx
+    return {
+        "status": "done",
+        "maintained_expected_object_ids": bool(maintained),
+        "first_missing_frame": first_missing_frame,
+        "empty_non_initial_frames": empty_non_initial_frames,
     }
 
 
@@ -1070,24 +1110,16 @@ def main(argv: list[str] | None = None) -> int:
 
         low_level_probe_payload: dict[str, Any] | None = None
         if args.run_low_level_mask_probe:
-            low_level_build = build_sam3_tracker(
-                checkpoint_path=checkpoint,
-                device="cuda",
-                multiplex_count=args.multiplex_count,
-                use_fa3=args.use_fa3,
-                use_rope_real=args.use_rope_real,
-                compile_model=args.compile,
-                strict_runtime=not args.allow_unsupported_runtime,
-                run_mode=SAM3_RUN_MODE_OFFICIAL,
-            )
-            if not low_level_build.available or low_level_build.predictor is None:
+            try:
+                low_level_probe_payload = _probe_state(args, exp_dir, model, video, checkpoint)
+            except Exception as exc:
                 low_level_probe_payload = {
-                    "status": "failed_low_level_build",
+                    "status": "failed",
+                    "api_path": "full_predictor_model.add_new_masks",
                     "checkpoint": str(checkpoint),
-                    "build": low_level_build.to_dict(),
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(),
                 }
-            else:
-                low_level_probe_payload = _probe_state(args, exp_dir, low_level_build.predictor, video, checkpoint)
             _atomic_json(logs_dir / "sam31_low_level_mask_probe.json", low_level_probe_payload)
 
         public_session = public_probe_payload.get("public_session_probe", {})
@@ -1095,8 +1127,14 @@ def main(argv: list[str] | None = None) -> int:
             public_session.get("status") == "done"
             and bool(public_session.get("maintained_expected_object_ids"))
         )
+        mask_probe = _mask_probe_summary(low_level_probe_payload)
+        mask_probe_ok = bool(mask_probe.get("maintained_expected_object_ids"))
+        if args.run_low_level_mask_probe:
+            status = "done" if mask_probe_ok else "failed_official_mask_api_probe"
+        else:
+            status = "done" if public_session_ok else "failed_public_session_probe"
         summary = {
-            "status": "done" if public_session_ok else "failed_public_session_probe",
+            "status": status,
             "experiment_dir": str(exp_dir),
             "api_introspection": str(logs_dir / "sam31_api_introspection.json"),
             "public_session_probe": str(logs_dir / "sam31_public_session_probe.json"),
@@ -1117,11 +1155,16 @@ def main(argv: list[str] | None = None) -> int:
             "checkpoint_audit_passed": bool(audit.get("passed")),
             "public_session_probe_status": public_session.get("status"),
             "public_session_maintained_expected_object_ids": public_session.get("maintained_expected_object_ids"),
+            "official_mask_probe_status": mask_probe.get("status"),
+            "official_mask_api_path": low_level_probe_payload.get("api_path") if low_level_probe_payload else None,
+            "official_mask_maintained_expected_object_ids": mask_probe.get("maintained_expected_object_ids"),
+            "official_mask_first_missing_frame": mask_probe.get("first_missing_frame"),
+            "official_mask_empty_non_initial_frames": mask_probe.get("empty_non_initial_frames"),
             "propagation": public_session.get("propagation", []),
         }
         _atomic_json(logs_dir / "summary.json", summary)
         print(json.dumps(summary, indent=2, ensure_ascii=True), flush=True)
-        return 0 if public_session_ok else 1
+        return 0 if (mask_probe_ok if args.run_low_level_mask_probe else public_session_ok) else 1
     except Exception as exc:
         payload = {
             "status": "failed",
