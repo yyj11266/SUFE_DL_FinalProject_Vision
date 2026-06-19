@@ -764,6 +764,8 @@ def _probe_public_session(
                 "type": "propagate_in_video",
                 "session_id": session_id,
                 "propagation_direction": "forward",
+                "start_frame_index": 0,
+                "max_frame_num_to_track": max(0, target_frame_count - 1),
             }
         ):
             row = {
