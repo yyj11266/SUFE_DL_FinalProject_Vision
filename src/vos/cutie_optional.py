@@ -94,6 +94,9 @@ def install_or_check_cutie(repo_dir: str | Path | None = None, install: bool = F
             repo_path.parent.mkdir(parents=True, exist_ok=True)
             subprocess.check_call(["git", "clone", "--depth", "1", CUTIE_REPO_URL, str(repo_path)])
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "-e", str(repo_path)])
+        repo_text = str(repo_path)
+        if repo_text not in sys.path:
+            sys.path.insert(0, repo_text)
         importlib.invalidate_caches()
     except Exception as exc:
         return CutieAvailability(False, "failed to install cutie", repo_path=str(repo_path), error=f"{type(exc).__name__}: {exc}")
