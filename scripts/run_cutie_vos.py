@@ -172,8 +172,22 @@ def main(argv: list[str] | None = None) -> int:
     status: dict[str, Any] = {"videos": {}, "summary": {}}
     errors: list[str] = []
     warnings: list[str] = []
+    if args.make_submission and (not args.sample_submission or not Path(args.sample_submission).expanduser().exists()):
+        errors.append("--make-submission requires an existing --sample-submission for strict format validation")
+    if not data_info.videos:
+        errors.append(
+            f"No videos were found under --data-root {data_root}; "
+            f"scan saw {int(data_info.scan.get('num_files', 0))} files"
+        )
+    if not selected:
+        errors.append("No videos selected for Cutie inference")
     if missing:
         errors.append(f"Requested videos not found: {missing}")
+    if errors:
+        status["summary"] = {"status": "failed", "errors": errors, "warnings": warnings}
+        _atomic_json(logs_dir / "per_video_status.json", status)
+        _write_failure_sanity(exp_dir, errors, warnings)
+        return 1
 
     cutie_status = install_or_check_cutie(args.cutie_repo_dir, install=bool(args.install_cutie))
     if not cutie_status.available:
