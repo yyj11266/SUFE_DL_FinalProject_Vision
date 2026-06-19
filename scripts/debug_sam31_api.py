@@ -1112,16 +1112,32 @@ def main(argv: list[str] | None = None) -> int:
 
         low_level_probe_payload: dict[str, Any] | None = None
         if args.run_low_level_mask_probe:
-            try:
-                low_level_probe_payload = _probe_state(args, exp_dir, model, video, checkpoint)
-            except Exception as exc:
+            add_new_masks = getattr(model, "add_new_masks", None)
+            if not callable(add_new_masks):
                 low_level_probe_payload = {
-                    "status": "failed",
+                    "status": "blocked_missing_official_mask_api",
                     "api_path": "full_predictor_model.add_new_masks",
                     "checkpoint": str(checkpoint),
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc(),
+                    "model_class": f"{type(model).__module__}.{type(model).__name__}",
+                    "error": f"{type(model).__name__} does not expose add_new_masks",
+                    "relevant_model_callables": [
+                        row
+                        for row in _callable_inventory(model)
+                        if "mask" in str(row.get("name", "")).lower()
+                        or "add" in str(row.get("name", "")).lower()
+                    ],
                 }
+            else:
+                try:
+                    low_level_probe_payload = _probe_state(args, exp_dir, model, video, checkpoint)
+                except Exception as exc:
+                    low_level_probe_payload = {
+                        "status": "failed",
+                        "api_path": "full_predictor_model.add_new_masks",
+                        "checkpoint": str(checkpoint),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc(),
+                    }
             _atomic_json(logs_dir / "sam31_low_level_mask_probe.json", low_level_probe_payload)
 
         public_session = public_probe_payload.get("public_session_probe", {})
@@ -1132,7 +1148,11 @@ def main(argv: list[str] | None = None) -> int:
         mask_probe = _mask_probe_summary(low_level_probe_payload)
         mask_probe_ok = bool(mask_probe.get("maintained_expected_object_ids"))
         if args.run_low_level_mask_probe:
-            status = "done" if mask_probe_ok else "failed_official_mask_api_probe"
+            status = (
+                "done"
+                if mask_probe_ok
+                else str(mask_probe.get("status") or "failed_official_mask_api_probe")
+            )
         else:
             status = "done" if public_session_ok else "failed_public_session_probe"
         summary = {
@@ -1144,12 +1164,16 @@ def main(argv: list[str] | None = None) -> int:
             "video_id": args.video_id,
             "object_ids": public_probe_payload["object_ids"],
             "sam3_checkpoint_load_target": "full_multiplex_predictor",
-            "sam3_submission_status": "blocked_public_mask_session_api",
+            "sam3_submission_status": "blocked_missing_official_mask_api"
+            if status == "blocked_missing_official_mask_api"
+            else "blocked_public_mask_session_api",
             "sam3_candidate_mode": "point_prompt_only",
             "sam3_public_mask_request": False,
-            "sam3_low_level_add_new_masks": True,
+            "sam3_low_level_add_new_masks": bool(callable(getattr(model, "add_new_masks", None))),
             "sam3_low_level_standalone_video_api": False,
-            "mask_api_path": None,
+            "mask_api_path": "full_predictor_model.add_new_masks"
+            if callable(getattr(model, "add_new_masks", None))
+            else None,
             "private_state_used": False,
             "previous_mask_recovery": False,
             "diagnostic_patch_applied": bool(patch_status.get("diagnostic_patch_applied")),

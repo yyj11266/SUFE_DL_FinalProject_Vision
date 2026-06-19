@@ -81,3 +81,20 @@ def test_mask_probe_summary_reports_early_object_collapse() -> None:
         "first_missing_frame": 1,
         "empty_non_initial_frames": 2,
     }
+
+
+def test_mask_probe_summary_preserves_missing_api_status() -> None:
+    summary = _mask_probe_summary(
+        {
+            "status": "blocked_missing_official_mask_api",
+            "api_path": "full_predictor_model.add_new_masks",
+            "error": "model does not expose add_new_masks",
+        }
+    )
+
+    assert summary == {
+        "status": "blocked_missing_official_mask_api",
+        "maintained_expected_object_ids": False,
+        "first_missing_frame": None,
+        "empty_non_initial_frames": None,
+    }
